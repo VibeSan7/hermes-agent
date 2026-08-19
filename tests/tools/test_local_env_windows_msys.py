@@ -302,13 +302,13 @@ class TestWrapCommandWindowsNativeCwd:
         ):
             env = LocalEnvironment(cwd=r"C:\Users\liush", timeout=10)
 
-        env._snapshot_ready = True
+        env._safe_state_ready = False
         wrapped = env._wrap_command("pwd", r"C:\Users\liush")
 
         assert "builtin cd -- /c/Users/liush || exit 126" in wrapped
         assert r"builtin cd -- C:\Users\liush || exit 126" not in wrapped
 
-    def test_init_session_bootstrap_rewrites_backslash_snapshot_paths(self, monkeypatch):
+    def test_init_session_bootstrap_rewrites_backslash_safe_state_paths(self, monkeypatch):
         captured = {}
 
         def fake_run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
@@ -317,7 +317,7 @@ class TestWrapCommandWindowsNativeCwd:
 
         monkeypatch.setattr(LocalEnvironment, "_run_bash", fake_run_bash)
 
-        snap = r"C:\Users\Alexander\AppData\Local\Temp\hermes-snap-deadbeef.sh"
+        state = r"C:\Users\Alexander\AppData\Local\Temp\hermes-safe-state-deadbeef.v1"
         with patch.object(LocalEnvironment, "__init__", lambda self, **kw: None):
             env = LocalEnvironment.__new__(LocalEnvironment)
             BaseEnvironment.__init__(
@@ -325,10 +325,11 @@ class TestWrapCommandWindowsNativeCwd:
                 cwd=r"C:\Users\Alexander\Documents",
                 timeout=10,
             )
-            env._snapshot_path = snap
-            env._cwd_file = snap + ".cwd"
+            env._safe_state_path = state
+            env._safe_state_platform = "msys"
+            env._cwd_file = state + ".cwd"
             env.init_session()
 
         script = captured["script"]
-        assert "/c/Users/Alexander/AppData/Local/Temp/hermes-snap-deadbeef.sh" in script
+        assert "/c/Users/Alexander/AppData/Local/Temp/hermes-safe-state-deadbeef.v1" in script
         assert r"C:\Users\Alexander\AppData" not in script

@@ -7,6 +7,8 @@ init_session() failure handling, and the CWD marker contract.
 import logging
 from unittest.mock import MagicMock
 
+import pytest
+
 from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
 
 
@@ -193,6 +195,17 @@ class TestEmbedStdinHeredoc:
         d1 = r1.split("'")[1]
         d2 = r2.split("'")[1]
         assert d1 != d2  # UUID-based, should be unique
+
+    def test_inline_stdin_uses_anonymous_process_substitution(self):
+        result = BaseEnvironment._embed_stdin_inline("cat", "hello\nworld")
+
+        assert result.startswith("{ cat; } < <(printf '%s' ")
+        assert "hello\nworld" in result
+        assert "HERMES_STDIN_" not in result
+
+    def test_inline_stdin_rejects_nul(self):
+        with pytest.raises(ValueError, match="NUL"):
+            BaseEnvironment._embed_stdin_inline("cat", "a\x00b")
 
 
 class TestInitSessionFailure:

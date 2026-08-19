@@ -531,8 +531,8 @@ class BaseEnvironment(ABC):
     interrupt handling, and timeout enforcement.
     """
 
-    # Subclasses that embed stdin as a heredoc (Modal, Daytona) set this.
-    _stdin_mode: str = "pipe"  # "pipe" or "heredoc"
+    # Backends choose pipe, heredoc, or inline process-substitution stdin.
+    _stdin_mode: str = "pipe"
 
     # Safe-state initialization timeout (override for slow cold-starts).
     _safe_state_timeout: int = 30
@@ -611,6 +611,10 @@ class BaseEnvironment(ABC):
             platform=self._safe_state_platform,
         )
 
+    def _prepare_safe_state_artifact(self) -> tuple[bool, str]:
+        """Validate backend-specific file identity before state use."""
+        return True, ""
+
     def _disable_safe_state(self, reason_code: str) -> None:
         self._safe_state_ready = False
         if self._safe_state_disabled_reason is None:
@@ -651,6 +655,10 @@ class BaseEnvironment(ABC):
                 '[ "$_hss_init_rc" -eq 0 ] || exit "$_hss_init_rc"',
                 scripts.capture,
                 "_hss_init_rc=$?",
+                'if [ "$_hss_init_rc" -ne 0 ]; then',
+                "_hss_capture",
+                "_hss_init_rc=$?",
+                "fi",
                 '[ "$_hss_init_rc" -eq 0 ] || exit "$_hss_init_rc"',
                 f"builtin cd -- {quoted_cwd} 2>/dev/null || true",
                 f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"",
@@ -671,6 +679,10 @@ class BaseEnvironment(ABC):
                 raise RuntimeError(
                     f"safe state bootstrap failed with exit code {returncode}"
                 )
+            valid, reason = self._prepare_safe_state_artifact()
+            if not valid:
+                self._disable_safe_state(reason)
+                return
             self._safe_state_ready = True
             self._safe_state_disabled_reason = None
             self._safe_state_warning_emitted = False
@@ -737,6 +749,10 @@ class BaseEnvironment(ABC):
         parts: list[str] = []
         scripts: SafeStateShellScripts | None = None
         if self._safe_state_ready:
+            valid, reason = self._prepare_safe_state_artifact()
+            if not valid:
+                self._disable_safe_state(reason)
+        if self._safe_state_ready:
             try:
                 scripts = self._safe_state_scripts()
             except Exception:
@@ -780,6 +796,10 @@ class BaseEnvironment(ABC):
                     scripts.capture,
                     "_hss_rc=$?",
                     'if [ "$_hss_rc" -ne 0 ]; then',
+                    "_hss_capture",
+                    "_hss_rc=$?",
+                    "fi",
+                    'if [ "$_hss_rc" -ne 0 ]; then',
                     f"printf '\\n{self._safe_state_marker}capture_%s"
                     f"{self._safe_state_marker}\\n' \"$_hss_rc\"",
                     "fi",
@@ -802,6 +822,15 @@ class BaseEnvironment(ABC):
         """Append stdin_data as a shell heredoc to the command string."""
         delimiter = f"HERMES_STDIN_{uuid.uuid4().hex[:12]}"
         return f"{command} << '{delimiter}'\n{stdin_data}\n{delimiter}"
+
+    @staticmethod
+    def _embed_stdin_inline(command: str, stdin_data: str) -> str:
+        """Feed exact text through an anonymous Bash process substitution."""
+        if "\x00" in stdin_data:
+            raise ValueError("NUL is not supported by inline terminal stdin")
+        return (
+            f"{{ {command}; }} < <(printf '%s' {shlex.quote(stdin_data)})"
+        )
 
     # ------------------------------------------------------------------
     # Process lifecycle
@@ -1291,6 +1320,9 @@ class BaseEnvironment(ABC):
         if effective_stdin and self._stdin_mode == "heredoc":
             exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
             effective_stdin = None
+        elif effective_stdin and self._stdin_mode == "inline":
+            exec_command = self._embed_stdin_inline(exec_command, effective_stdin)
+            effective_stdin = None
 
         wrapped = self._wrap_command(exec_command, effective_cwd)
 
@@ -1305,6 +1337,10 @@ class BaseEnvironment(ABC):
             proc, timeout=effective_timeout, bounded_capture=bounded_capture
         )
         self._extract_safe_state_status(result)
+        if self._safe_state_ready:
+            valid, reason = self._prepare_safe_state_artifact()
+            if not valid:
+                self._disable_safe_state(reason)
         self._update_cwd(result)
 
         return result

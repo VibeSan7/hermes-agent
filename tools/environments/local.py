@@ -1,4 +1,4 @@
-"""Local execution environment — spawn-per-call with session snapshot."""
+"""Local execution environment with default-deny safe terminal state."""
 
 import logging
 import ntpath
@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,111 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+_WINDOWS_REPARSE_POINT = 0x400
+_LOCAL_STATE_STALE_SECONDS = 24 * 60 * 60
+
+
+def _prune_stale_local_state_files(cache_dir: Path) -> None:
+    cutoff = time.time() - _LOCAL_STATE_STALE_SECONDS
+    patterns = (
+        "hermes-safe-state-*.v1",
+        "hermes-safe-state-*.v1.tmp.*",
+        "hermes-snap-*.sh",
+    )
+    for pattern in patterns:
+        for candidate in cache_dir.glob(pattern):
+            try:
+                info = candidate.lstat()
+                if stat.S_ISDIR(info.st_mode) or info.st_mtime >= cutoff:
+                    continue
+                candidate.unlink()
+            except OSError:
+                continue
+
+
+def _windows_current_user_sid():
+    import win32api
+    import win32con
+    import win32security
+
+    token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(),
+        win32con.TOKEN_QUERY,
+    )
+    return win32security.GetTokenInformation(
+        token,
+        win32security.TokenUser,
+    )[0]
+
+
+def _windows_private_sids():
+    import win32security
+
+    return (
+        _windows_current_user_sid(),
+        win32security.ConvertStringSidToSid("S-1-5-18"),
+        win32security.ConvertStringSidToSid("S-1-5-32-544"),
+    )
+
+
+def _set_windows_private_acl(path: Path, *, directory: bool) -> None:
+    import ntsecuritycon
+    import win32security
+
+    inheritance = 0
+    if directory:
+        inheritance = (
+            win32security.CONTAINER_INHERIT_ACE
+            | win32security.OBJECT_INHERIT_ACE
+        )
+    dacl = win32security.ACL()
+    for sid in _windows_private_sids():
+        dacl.AddAccessAllowedAceEx(
+            win32security.ACL_REVISION,
+            inheritance,
+            ntsecuritycon.FILE_ALL_ACCESS,
+            sid,
+        )
+    win32security.SetNamedSecurityInfo(
+        str(path),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        dacl,
+        None,
+    )
+
+
+def _windows_acl_is_private(path: Path) -> bool:
+    import ntsecuritycon
+    import win32security
+
+    security = win32security.GetNamedSecurityInfo(
+        str(path),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION,
+    )
+    dacl = security.GetSecurityDescriptorDacl()
+    if dacl is None or dacl.GetAceCount() != 3:
+        return False
+    expected = {
+        win32security.ConvertSidToStringSid(sid)
+        for sid in _windows_private_sids()
+    }
+    observed: set[str] = set()
+    for index in range(dacl.GetAceCount()):
+        header, mask, sid = dacl.GetAce(index)
+        if header[0] != win32security.ACCESS_ALLOWED_ACE_TYPE:
+            return False
+        if header[1] & win32security.INHERITED_ACE:
+            return False
+        if mask & ntsecuritycon.FILE_ALL_ACCESS != ntsecuritycon.FILE_ALL_ACCESS:
+            return False
+        observed.add(win32security.ConvertSidToStringSid(sid))
+    return observed == expected
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -1713,58 +1819,40 @@ class LocalEnvironment(BaseEnvironment):
     CWD persists through the shared in-band stdout marker.
     """
 
+    _stdin_mode = "inline" if _IS_WINDOWS else "pipe"
+
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
+        self._local_safe_dir_ready = True
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
+        if _IS_WINDOWS:
+            self._safe_state_platform = "msys"
+        if not self._local_safe_dir_ready:
+            self._disable_safe_state("directory_permissions")
+            return
         self.init_session()
 
     def get_temp_dir(self) -> str:
-        """Return a shell-safe writable temp dir for local execution.
+        """Return the private Hermes cache used for Local state artifacts."""
+        from hermes_constants import get_hermes_home
 
-        Termux does not provide /tmp by default, but exposes a POSIX TMPDIR.
-        Prefer POSIX-style env vars when available, keep using /tmp on regular
-        Unix systems, and only fall back to tempfile.gettempdir() when it also
-        resolves to a POSIX path.
-
-        Check the environment configured for this backend first so callers can
-        override the temp root explicitly (for example via terminal.env or a
-        custom TMPDIR), then fall back to the host process environment.
-
-        **Windows:** hardcoded ``/tmp`` is wrong in two ways — native Python
-        can't open the path, and the Windows default temp (``%TEMP%``) often
-        contains spaces (``C:\\Users\\Some Name\\AppData\\Local\\Temp``) that
-        break unquoted bash interpolations.  Use a dedicated cache dir under
-        ``HERMES_HOME`` instead — single-word path, guaranteed to exist, same
-        string resolves in both Git Bash and native Python.
-        """
-        if _IS_WINDOWS:
-            # Derive a Windows-safe temp dir under HERMES_HOME.  Using
-            # forward slashes makes the same string work unchanged in bash
-            # command interpolations AND in Python ``open()`` — Windows
-            # accepts forward slashes in filesystem paths, and we control
-            # the path so we can guarantee no spaces.
-            try:
-                from hermes_constants import get_hermes_home
-                cache_dir = get_hermes_home() / "cache" / "terminal"
-            except Exception:
-                cache_dir = Path(tempfile.gettempdir()) / "hermes_terminal"
+        cache_dir = get_hermes_home() / "cache" / "terminal"
+        try:
             cache_dir.mkdir(parents=True, exist_ok=True)
-            # Force forward slashes so the same string serves both contexts.
-            return str(cache_dir).replace("\\", "/")
-
-        for env_var in ("TMPDIR", "TMP", "TEMP"):
-            candidate = self.env.get(env_var) or os.environ.get(env_var)
-            if candidate and candidate.startswith("/"):
-                return candidate.rstrip("/") or "/"
-
-        if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK | os.X_OK):
-            return "/tmp"
-
-        candidate = tempfile.gettempdir()
-        if candidate.startswith("/"):
-            return candidate.rstrip("/") or "/"
-
-        return "/tmp"
+            if _IS_WINDOWS:
+                _set_windows_private_acl(cache_dir, directory=True)
+            else:
+                cache_dir.chmod(0o700)
+            _prune_stale_local_state_files(cache_dir)
+        except Exception:
+            self._local_safe_dir_ready = False
+            logger.warning(
+                "Could not secure Local terminal cache directory %s",
+                cache_dir,
+                exc_info=True,
+            )
+        value = str(cache_dir)
+        return value.replace("\\", "/") if _IS_WINDOWS else value
 
     @staticmethod
     def _quote_cwd_for_cd(cwd: str) -> str:
@@ -1774,6 +1862,44 @@ class LocalEnvironment(BaseEnvironment):
     def _safe_state_shell_path(self, path: str) -> str:
         """Rewrite the safe-state path into the target Bash namespace."""
         return _bash_safe_path(path)
+
+    def _prepare_safe_state_artifact(self) -> tuple[bool, str]:
+        path = Path(self._safe_state_path)
+        try:
+            expected_parent = Path(self.get_temp_dir()).resolve(strict=True)
+            if path.parent.resolve(strict=True) != expected_parent:
+                return False, "outside_private_cache"
+            info = path.lstat()
+        except FileNotFoundError:
+            return False, "missing"
+        except OSError:
+            return False, "stat_failed"
+
+        attributes = getattr(info, "st_file_attributes", 0)
+        if stat.S_ISLNK(info.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
+            return False, "reparse"
+        if not stat.S_ISREG(info.st_mode):
+            return False, "non_regular"
+        if info.st_nlink != 1:
+            return False, "hardlink"
+
+        try:
+            if _IS_WINDOWS:
+                _set_windows_private_acl(path, directory=False)
+                if not _windows_acl_is_private(path):
+                    return False, "acl"
+            else:
+                path.chmod(0o600)
+                if stat.S_IMODE(path.stat().st_mode) != 0o600:
+                    return False, "mode"
+        except Exception:
+            logger.warning(
+                "Could not secure Local safe-state artifact %s",
+                path,
+                exc_info=True,
+            )
+            return False, "permissions"
+        return True, ""
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
@@ -1787,7 +1913,13 @@ class LocalEnvironment(BaseEnvironment):
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        script_input = None
+        if _IS_WINDOWS and stdin_data is None:
+            args = [bash, "-l", "-s"] if login else [bash, "-s"]
+            script_input = cmd_string
+        else:
+            args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        input_payload = script_input if script_input is not None else stdin_data
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
@@ -1827,7 +1959,7 @@ class LocalEnvironment(BaseEnvironment):
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            stdin=subprocess.PIPE if input_payload is not None else subprocess.DEVNULL,
             start_new_session=True,
             cwd=_popen_cwd,
             **_popen_kwargs,
@@ -1838,8 +1970,8 @@ class LocalEnvironment(BaseEnvironment):
             except ProcessLookupError:
                 pass
 
-        if stdin_data is not None:
-            _pipe_stdin(proc, stdin_data)
+        if input_payload is not None:
+            _pipe_stdin(proc, input_payload)
 
         return proc
 
