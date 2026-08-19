@@ -1,9 +1,8 @@
 """Base class for all Hermes execution environment backends.
 
 Unified spawn-per-call model: every command spawns a fresh ``bash -c`` process.
-A session snapshot (env vars, functions, aliases) is captured once at init and
-re-sourced before each command. CWD persists via in-band stdout markers (remote)
-or a temp file (local).
+Default-deny safe terminal state preserves only validated Python/Conda runtime
+markers in single-profile mode. CWD persists through an in-band stdout marker.
 """
 
 import codecs
@@ -20,10 +19,15 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from pathlib import Path
-from typing import IO, Callable, Iterable, Protocol
+from typing import IO, Callable, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
+from tools.environments.safe_terminal_state import (
+    SafeStatePlatform,
+    SafeStateShellScripts,
+    build_safe_state_shell_scripts,
+)
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -510,81 +514,8 @@ def _cwd_marker(session_id: str) -> str:
     return f"__HERMES_CWD_{session_id}__"
 
 
-# Per-session variables that the gateway bridges freshly onto every command's
-# process environment (via tools/environments/local._inject_session_context_env,
-# reading gateway.session_context._VAR_MAP). They must NEVER be persisted into
-# the shared bash session snapshot: a single long-lived backend serves many
-# concurrent sessions (the messaging gateway, TUI, desktop/web dashboard all
-# collapse the terminal to one "default" environment), so ``export -p`` dumping
-# the FIRST session's HERMES_SESSION_ID into the snapshot makes every LATER
-# session ``source`` that stale value and see a FOREIGN session's identity —
-# overriding the correct per-command Popen env (issue: cross-session
-# HERMES_SESSION_ID leak via the shared snapshot). Stripping them from the
-# snapshot is safe because they are re-injected on every command; a snapshot
-# should only carry the user's own shell state (PATH, functions, exports they
-# set), not Hermes' per-turn session identity.
-#
-# Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
-# with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
-# as the Python-side contract for the exclusion set; the dump path unsets by
-# name/prefix instead of grepping declare lines (see below / issue #71296).
-_SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION)"
-)
-_SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def _export_dump_excluding_session_vars(
-    tmp_path: str,
-    excluded_names: Iterable[str] = (),
-) -> str:
-    """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
-    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``) and any
-    additional names supplied by the caller.
-
-    Unset the bridged vars in a subshell *before* ``export -p``. A line-based
-    ``grep -vE`` filter is unsafe: bash 3.2 prints a value containing a newline
-    as a multi-line ``declare -x NAME="…`` block, so only the opener matches the
-    regex and continuation lines (e.g. ``curl … | bash #`` smuggled into a
-    Matrix room/display name via ``HERMES_SESSION_CHAT_NAME``) land in the
-    snapshot and execute on the next ``source`` (issue #71296). Unsetting first
-    means ``export -p`` never emits those vars — including any continuation
-    lines. ``|| true`` keeps the success contract for callers that chain on it.
-
-    The dump MUST be wrapped in a brace group with the redirection applied to
-    the group. *tmp_path* is typically a shell-variable expansion (a
-    mktemp-allocated per-writer temp name); a redirection attached to a
-    pipeline segment would expand it inside that segment's subshell,
-    potentially inconsistently with the parent that expands the follow-up
-    ``mv``. The brace-group redirect is expanded in the current shell,
-    keeping both expansions consistent.
-    """
-    # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
-    # because ``unset`` with only missing names is ignored under 2>/dev/null.
-    # Quote caller-provided names so malformed configuration can never become
-    # shell syntax. Valid environment names remain unquoted by shlex.quote().
-    safe_names = {
-        name for name in excluded_names
-        if isinstance(name, str) and name
-    }
-    extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
-    if extra_unset:
-        extra_unset = f" {extra_unset}"
-    return (
-        "{ ( "
-        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        # AI_AGENT / HERMES_AGENT are per-command attribution markers
-        # (re-exported by every _wrap_command with outer-harness-preserving
-        # ${VAR:-default} semantics).  Persisting them into the snapshot
-        # would make the FIRST command's value override a later outer
-        # harness value arriving via the process env, exactly like the
-        # session-var leak this dump already guards against.
-        "AI_AGENT HERMES_AGENT "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
-        "export -p; "
-        ") || true; } "
-        f"> {tmp_path}"
-    )
+def _safe_state_marker(session_id: str) -> str:
+    return f"__HERMES_SAFE_STATE_{session_id}__"
 
 
 # ---------------------------------------------------------------------------
@@ -596,20 +527,15 @@ class BaseEnvironment(ABC):
     """Common interface and unified execution flow for all Hermes backends.
 
     Subclasses implement ``_run_bash()`` and ``cleanup()``.  The base class
-    provides ``execute()`` with session snapshot sourcing, CWD tracking,
+    provides ``execute()`` with safe state persistence, CWD tracking,
     interrupt handling, and timeout enforcement.
     """
 
     # Subclasses that embed stdin as a heredoc (Modal, Daytona) set this.
     _stdin_mode: str = "pipe"  # "pipe" or "heredoc"
 
-    # Snapshot creation timeout (override for slow cold-starts).
-    _snapshot_timeout: int = 30
-
-    # Local and Docker override this because they resolve allowlisted values
-    # through the active profile scope. Other backends keep their existing
-    # snapshot semantics until they implement the same resolver contract.
-    _profile_scoped_passthrough: bool = False
+    # Safe-state initialization timeout (override for slow cold-starts).
+    _safe_state_timeout: int = 30
 
     def get_temp_dir(self) -> str:
         """Return the backend temp directory used for session artifacts.
@@ -627,11 +553,16 @@ class BaseEnvironment(ABC):
 
         self._session_id = uuid.uuid4().hex[:12]
         temp_dir = self.get_temp_dir().rstrip("/") or "/"
-        self._snapshot_path = f"{temp_dir}/hermes-snap-{self._session_id}.sh"
+        self._safe_state_path = (
+            f"{temp_dir}/hermes-safe-state-{self._session_id}.v1"
+        )
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
-        self._snapshot_ready = False
-        self._snapshot_passthrough_names: set[str] = set()
+        self._safe_state_marker = _safe_state_marker(self._session_id)
+        self._safe_state_ready = False
+        self._safe_state_disabled_reason: str | None = None
+        self._safe_state_warning_emitted = False
+        self._safe_state_platform: SafeStatePlatform = "posix"
         # When True, login bash is unusable (e.g. broken Git-for-Windows
         # ``Directory \\drivers\\etc`` startup) so execute() must not fall
         # back to ``bash -l`` per command — use non-login ``bash -c`` instead.
@@ -662,144 +593,107 @@ class BaseEnvironment(ABC):
         ...
 
     # ------------------------------------------------------------------
-    # Session snapshot (init_session)
+    # Safe terminal state
     # ------------------------------------------------------------------
 
-    def _additional_profile_scoped_passthrough_names(self) -> Iterable[str]:
-        """Return backend-specific names that must not persist in snapshots."""
-        return ()
+    def _safe_state_shell_path(self, path: str) -> str:
+        """Return *path* in the target Bash namespace without quoting it."""
+        return path
 
-    def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
-        """Return profile-scoped names that must not persist in the snapshot.
+    def _safe_state_scripts(self) -> SafeStateShellScripts:
+        state_path = self._safe_state_shell_path(self._safe_state_path)
+        temp_template = self._safe_state_shell_path(
+            self._safe_state_path + ".tmp.XXXXXXXXXX"
+        )
+        return build_safe_state_shell_scripts(
+            state_path,
+            temp_template,
+            platform=self._safe_state_platform,
+        )
 
-        The set is monotonic for the environment lifetime. A skill/config
-        allowlist can be cleared after a value was captured; retaining the
-        exclusion prevents that old value from becoming visible to a later
-        profile through the shared snapshot.
-        """
-        if not self._profile_scoped_passthrough:
-            return ()
-        try:
-            from agent.secret_scope import is_multiplex_active
-            if is_multiplex_active():
-                from tools.env_passthrough import get_all_passthrough
-                names = (
-                    *get_all_passthrough(),
-                    *self._additional_profile_scoped_passthrough_names(),
-                )
-                self._snapshot_passthrough_names.update(
-                    name
-                    for name in names
-                    if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name)
-                )
-        except Exception:
-            logger.debug(
-                "Could not refresh profile-scoped snapshot exclusions",
-                exc_info=True,
-            )
-        return tuple(sorted(self._snapshot_passthrough_names))
+    def _disable_safe_state(self, reason_code: str) -> None:
+        self._safe_state_ready = False
+        if self._safe_state_disabled_reason is None:
+            self._safe_state_disabled_reason = reason_code
+        if self._safe_state_warning_emitted:
+            return
+        self._safe_state_warning_emitted = True
+        logger.warning(
+            "Safe terminal state disabled (session=%s, backend=%s, reason=%s, path=%s)",
+            self._session_id,
+            type(self).__name__,
+            self._safe_state_disabled_reason,
+            self._safe_state_path,
+        )
 
     def init_session(self):
-        """Capture login shell environment into a snapshot file.
+        """Capture validated safe runtime state from a login shell."""
+        try:
+            from agent.secret_scope import is_multiplex_active
+        except Exception:
+            self._disable_safe_state("scope_unavailable")
+            return
+        if is_multiplex_active():
+            self._disable_safe_state("multiplex_mode")
+            return
 
-        Called once after backend construction.  On success, sets
-        ``_snapshot_ready = True`` so subsequent commands source the snapshot
-        instead of running with ``bash -l``.
-        """
-        # Full capture: env vars, functions, aliases, shell options.
-        # Restore configured cwd after login shell profile scripts, which may
-        # change the working directory (e.g. bashrc `cd ~`).  Without this,
-        # pwd -P captures the profile's directory, not terminal.cwd.
-        # Route through ``_quote_cwd_for_cd`` (not a bare ``shlex.quote``) so
-        # the Windows subclass override converts a native ``C:\Users\x`` cwd to
-        # the Git-Bash ``/c/Users/x`` form the bootstrap ``cd`` can resolve.
-        # Without this the snapshot bootstrap ``cd`` below fails on Windows and
-        # ``pwd -P`` captures the login shell's directory, not ``terminal.cwd``.
-        _quoted_cwd = self._quote_cwd_for_cd(self.cwd)
-        # Quote snapshot / cwd-file paths via ``_quote_shell_path`` so the
-        # LocalEnvironment override can rewrite ``C:/...`` (and mixed
-        # ``/c/Users\\...``) to ``/c/...`` before quoting — bare drive paths
-        # in the bootstrap script trip MSYS into the
-        # ``Directory \\drivers\\etc does not exist`` failure class.
-        # On POSIX this is plain ``shlex.quote``.
-        _quoted_snap = self._quote_shell_path(self._snapshot_path)
-        # Use atomic file replacement: assemble the snapshot in a temp file,
-        # then mv it over the final path.  This prevents concurrent source()
-        # calls from reading a half-written snapshot when another terminal
-        # command finishes and rewrites the env vars (issue #38249).  `mv` is
-        # atomic on POSIX when src and dest are on the same filesystem, so
-        # source() either sees the old complete snapshot or the new complete
-        # one — never a partial/truncated file.
-        #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` would be unique per writer,
-        # but macOS ships bash 3.2 which does NOT provide it — the name expands
-        # empty there, so every writer shares one temp path and the race is
-        # back.  ``mktemp`` allocates a per-writer unique path portably across
-        # bash versions.  The template is shell-quoted (Windows/Git-Bash drive
-        # letters, spaces) and the resulting path lives in a shell variable so
-        # every later expansion is consistent.
-        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
-        _snap_tmp = '"$__hermes_snap_tmp"'
-        snapshot_excluded = self._snapshot_excluded_passthrough_names()
-        bootstrap = (
-            f"umask 077\n"
-            f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
-            f"{_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)}\n"
-            # Dump function definitions, filtering out private (``_``-prefixed)
-            # helpers — mainly bash-completion internals (``_git``, ``_make``…)
-            # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
-            # is line-based: it strips the function *header* line but leaves the
-            # orphaned ``{ … }`` body behind, which corrupts the snapshot and
-            # makes every sourced command fail (e.g. exit 127).  Selecting the
-            # wanted names with ``declare -F`` first, then dumping only those
-            # whole definitions, preserves the filter's intent without ever
-            # tearing a function body.  The non-empty guard matters: bare
-            # ``declare -f`` with no name args dumps ALL functions, so an empty
-            # name list (only private funcs present) would otherwise leak the
-            # very functions we meant to drop.
-            f"__hermes_fns=$(declare -F | awk '{{print $3}}' | grep -vE '^_[^_]') || true\n"
-            f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns "
-            f">> {_snap_tmp} 2>/dev/null || true\n"
-            f"alias -p >> {_snap_tmp}\n"
-            f"echo 'shopt -s expand_aliases' >> {_snap_tmp}\n"
-            f"echo 'set +e' >> {_snap_tmp}\n"
-            f"echo 'set +u' >> {_snap_tmp}\n"
-            # Publish atomically only if assembly succeeded; otherwise drop the
-            # partial temp rather than leave it to be sourced or orphaned.
-            f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
-            f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
-            f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
+        try:
+            scripts = self._safe_state_scripts()
+        except Exception:
+            self._disable_safe_state("script_build_failed")
+            return
+
+        quoted_cwd = self._quote_cwd_for_cd(self.cwd)
+        bootstrap = "\n".join(
+            (
+                scripts.probe,
+                "_hss_init_rc=$?",
+                '[ "$_hss_init_rc" -eq 0 ] || exit "$_hss_init_rc"',
+                scripts.capture,
+                "_hss_init_rc=$?",
+                '[ "$_hss_init_rc" -eq 0 ] || exit "$_hss_init_rc"',
+                f"builtin cd -- {quoted_cwd} 2>/dev/null || true",
+                f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"",
+            )
         )
         try:
-            proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
-            result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
-            if int(result.get("returncode") or 0) != 0:
+            proc = self._run_bash(
+                bootstrap,
+                login=True,
+                timeout=self._safe_state_timeout,
+            )
+            result = self._wait_for_process(
+                proc,
+                timeout=self._safe_state_timeout,
+            )
+            returncode = int(result.get("returncode") or 0)
+            if returncode != 0:
                 raise RuntimeError(
-                    f"snapshot bootstrap failed with exit code {result.get('returncode')}"
+                    f"safe state bootstrap failed with exit code {returncode}"
                 )
-            self._snapshot_ready = True
+            self._safe_state_ready = True
+            self._safe_state_disabled_reason = None
+            self._safe_state_warning_emitted = False
             self._update_cwd(result)
             logger.info(
-                "Session snapshot created (session=%s, cwd=%s)",
+                "Safe terminal state created (session=%s, cwd=%s)",
                 self._session_id,
                 self.cwd,
             )
         except Exception as exc:
-            self._snapshot_ready = False
-            # Default fallback is bash -l per command so PATH/nvm/etc still
-            # load.  If login itself is dead (classic Windows Git Bash
-            # ``Directory \\drivers\\etc does not exist``), that fallback
-            # would brick every tool — prefer non-login bash -c instead.
+            self._disable_safe_state("init_failed")
             detail = str(exc)
             prefer_nonlogin = False
             try:
-                probe = self._run_bash("true", login=False, timeout=min(15, self._snapshot_timeout))
-                probe_result = self._wait_for_process(probe, timeout=min(15, self._snapshot_timeout))
+                probe = self._run_bash(
+                    "true",
+                    login=False,
+                    timeout=min(15, self._safe_state_timeout),
+                )
+                probe_result = self._wait_for_process(
+                    probe,
+                    timeout=min(15, self._safe_state_timeout),
+                )
                 prefer_nonlogin = int(probe_result.get("returncode") or 0) == 0
                 if not prefer_nonlogin:
                     detail = (probe_result.get("stdout") or detail).strip() or detail
@@ -809,15 +703,15 @@ class BaseEnvironment(ABC):
             self._prefer_nonlogin = prefer_nonlogin
             if prefer_nonlogin:
                 logger.warning(
-                    "init_session failed (session=%s): %s — "
-                    "login bash unusable; falling back to non-login bash -c",
+                    "Safe state init failed (session=%s): %s — "
+                    "login Bash unusable; falling back to non-login Bash",
                     self._session_id,
                     exc,
                 )
             else:
                 logger.warning(
-                    "init_session failed (session=%s): %s — "
-                    "falling back to bash -l per command",
+                    "Safe state init failed (session=%s): %s — "
+                    "falling back to login Bash per command",
                     self._session_id,
                     detail,
                 )
@@ -837,126 +731,66 @@ class BaseEnvironment(ABC):
             return f"$HOME/{shlex.quote(cwd[2:])}"
         return shlex.quote(cwd)
 
-    def _quote_shell_path(self, path: str) -> str:
-        """Quote *path* for interpolation into a bash script.
-
-        LocalEnvironment overrides this to rewrite native/mixed Windows
-        paths to ``/c/...`` before quoting. Remote backends leave paths
-        as-is (they already speak POSIX).
-        """
-        return shlex.quote(path)
-
     def _wrap_command(self, command: str, cwd: str) -> str:
-        """Build the full bash script that sources snapshot, cd's, runs command,
-        re-dumps env vars, and emits CWD markers."""
+        """Build a Bash wrapper with default-deny safe state and CWD markers."""
         escaped = command.replace("'", "'\\''")
+        parts: list[str] = []
+        scripts: SafeStateShellScripts | None = None
+        if self._safe_state_ready:
+            try:
+                scripts = self._safe_state_scripts()
+            except Exception:
+                self._disable_safe_state("script_build_failed")
 
-        # Quote the snapshot path (see init_session — LocalEnvironment
-        # rewrites ``C:/...`` to ``/c/...`` so MSYS doesn't mangle it).
-        _quoted_snap = self._quote_shell_path(self._snapshot_path)
-        # Use atomic file replacement for env snapshot updates (issue #38249).
-        # Assemble into a per-writer-unique temp file, then mv to atomically
-        # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``mktemp`` is used instead of
-        # ``$BASHPID``/``$$`` because macOS bash 3.2 lacks ``$BASHPID`` (it
-        # expands empty, collapsing every writer onto one temp name) and ``$$``
-        # is shared by ``&``-launched subshells.  Template shell-quoted
-        # (Windows/spaces); the allocated path lives in a shell variable.
-        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
-        _snap_tmp = '"$__hermes_snap_tmp"'
-
-        parts = []
-        passthrough_names = self._snapshot_excluded_passthrough_names()
-
-        # A shared snapshot may contain the previous profile's value. Save
-        # the current process environment before sourcing it, then restore the
-        # current profile's value (or unset the name) immediately afterwards.
-        # Values stay in environment memory and never enter the shell command
-        # string, so secrets are not exposed through process arguments/logs.
-        saved_names: list[tuple[str, str, str]] = []
-        for name in passthrough_names:
-            marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
-            present = f"{marker}_PRESENT"
-            value = f"{marker}_VALUE"
-            saved_names.append((name, present, value))
-            parts.append(f"{present}=${{{name}+x}}")
-            parts.append(f"{value}=${{{name}-}}")
-
-        # Source snapshot (env vars from previous commands).
-        # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain
-        # Homebrew bash builds) sourcing a file containing ``declare -x``
-        # can emit the declarations to stdout, leaking ~60 lines of env
-        # vars into every tool response (issue #15459).  Linux bash is
-        # silent here, but the redirect is harmless.
-        if self._snapshot_ready:
-            parts.append(
-                f"source {_quoted_snap} >/dev/null 2>&1 || true"
+        if scripts is not None and self._safe_state_ready:
+            parts.extend(
+                (
+                    scripts.probe,
+                    "_hss_rc=$?",
+                    "_hss_state_ok=1",
+                    'if [ "$_hss_rc" -ne 0 ]; then',
+                    f"printf '\\n{self._safe_state_marker}probe_%s"
+                    f"{self._safe_state_marker}\\n' \"$_hss_rc\"",
+                    "_hss_state_ok=0",
+                    "else",
+                    scripts.apply,
+                    "_hss_rc=$?",
+                    'if [ "$_hss_rc" -ne 0 ]; then',
+                    f"printf '\\n{self._safe_state_marker}apply_%s"
+                    f"{self._safe_state_marker}\\n' \"$_hss_rc\"",
+                    "_hss_state_ok=0",
+                    "fi",
+                    "fi",
+                )
             )
 
-        for name, present, value in saved_names:
-            parts.append(
-                f'if [ "${present}" = x ]; then export {name}="${value}"; '
-                f'else unset {name}; fi'
-            )
-            parts.append(f"unset {present} {value}")
-
-        # Harness attribution: every tool subprocess advertises that it runs
-        # under Hermes via the cross-agent ``AI_AGENT`` standard (read by e.g.
-        # huggingface_hub's agent detection) plus the Hermes-specific
-        # ``HERMES_AGENT`` marker.  The value MUST equal our id in the public
-        # agent-harness registry (``hermes-agent`` — see huggingface.js
-        # ``agent-harnesses.ts``); standard-var matching is exact, so any other
-        # value is reported as "unknown".  Setting it here (rather than only in
-        # the host process env) is what carries the marker into REMOTE backends
-        # (Docker/SSH/Modal/Daytona/Singularity/Vercel), whose exec env is not
-        # inherited from the Hermes process.  ``${VAR:-default}`` semantics:
-        # never clobber an outer harness value that arrived via the inherited
-        # process env (Hermes running inside another agent's terminal).
         parts.append(
             'export AI_AGENT="${AI_AGENT:-hermes-agent}" '
             'HERMES_AGENT="${HERMES_AGENT:-true}"'
         )
-
-        # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
-        # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
-        # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
         parts.append(f"builtin cd -- {quoted_cwd} || exit 126")
-
-        # Run the actual command
         parts.append(f"eval '{escaped}'")
         parts.append("__hermes_ec=$?")
-        # Restrict Hermes metadata files without changing the user's command
-        # umask. Snapshot files may contain env-carried secrets.
-        parts.append("umask 077")
 
-        # Re-dump env vars to snapshot (atomic replacement to avoid races).
-        # Chain mv on the export succeeding so a failed/partial dump never
-        # replaces a good snapshot; drop the temp on failure so it isn't
-        # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
-        # NOTE: the temp path is allocated with mktemp into a shell variable
-        # first — the redirection inside _export_dump_excluding_session_vars is
-        # attached to a brace group so the variable expands in the same shell
-        # that later expands the ``mv`` operand, keeping both consistent.
-        if self._snapshot_ready:
-            parts.append(
-                f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names)} "
-                f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+        if scripts is not None and self._safe_state_ready:
+            parts.extend(
+                (
+                    'if [ "$_hss_state_ok" -eq 1 ]; then',
+                    scripts.capture,
+                    "_hss_rc=$?",
+                    'if [ "$_hss_rc" -ne 0 ]; then',
+                    f"printf '\\n{self._safe_state_marker}capture_%s"
+                    f"{self._safe_state_marker}\\n' \"$_hss_rc\"",
+                    "fi",
+                    "fi",
+                )
             )
 
-        # Emit the CWD stdout marker; all backends (including local, since
-        # PR #63255) parse it from output — no temp-file write needed.
-        # Use a distinct line for the marker. The leading \n ensures
-        # the marker starts on its own line even if the command doesn't
-        # end with a newline (e.g. printf 'exact'). We'll strip this
-        # injected newline in _extract_cwd_from_output.
         parts.append(
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\""
         )
         parts.append("exit $__hermes_ec")
-
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
@@ -1328,6 +1162,23 @@ class BaseEnvironment(ABC):
             pass
 
     # ------------------------------------------------------------------
+    # Safe-state and CWD extraction
+    # ------------------------------------------------------------------
+
+    def _extract_safe_state_status(self, result: dict) -> None:
+        """Disable persistence when the wrapper emits a value-free error marker."""
+        output = result.get("output", "")
+        marker = re.escape(self._safe_state_marker)
+        pattern = re.compile(
+            rf"\n?{marker}([A-Za-z0-9_]{{1,64}}){marker}\r?\n?"
+        )
+        matches = list(pattern.finditer(output))
+        if not matches:
+            return
+        self._disable_safe_state(matches[0].group(1))
+        result["output"] = pattern.sub("", output)
+
+    # ------------------------------------------------------------------
     # CWD extraction
     # ------------------------------------------------------------------
 
@@ -1443,9 +1294,9 @@ class BaseEnvironment(ABC):
 
         wrapped = self._wrap_command(exec_command, effective_cwd)
 
-        # Use login shell if snapshot failed (so user's profile still loads),
-        # unless login itself is broken — then non-login is the only path.
-        login = not self._snapshot_ready and not self._prefer_nonlogin
+        # Use a login shell when safe state is unavailable, unless login Bash
+        # itself is broken and init_session selected the non-login fallback.
+        login = not self._safe_state_ready and not self._prefer_nonlogin
 
         proc = self._run_bash(
             wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
@@ -1453,6 +1304,7 @@ class BaseEnvironment(ABC):
         result = self._wait_for_process(
             proc, timeout=effective_timeout, bounded_capture=bounded_capture
         )
+        self._extract_safe_state_status(result)
         self._update_cwd(result)
 
         return result

@@ -4,6 +4,7 @@ Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
 init_session() failure handling, and the CWD marker contract.
 """
 
+import logging
 from unittest.mock import MagicMock
 
 from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
@@ -54,254 +55,101 @@ class TestBoundedOutputCollector:
 class TestWrapCommand:
     def test_basic_shape(self):
         env = _TestableEnv()
-        env._snapshot_ready = True
+        env._safe_state_ready = True
         wrapped = env._wrap_command("echo hello", "/tmp")
 
-        assert "source" in wrapped
+        assert "source " not in wrapped
+        assert "export -p" not in wrapped
         assert "cd -- /tmp" in wrapped or "cd -- '/tmp'" in wrapped
         assert "eval 'echo hello'" in wrapped
         assert "__hermes_ec=$?" in wrapped
-        assert "export -p" in wrapped and "> " in wrapped
-        # cwd travels via the stdout marker only — no temp-file write.
-        assert "pwd -P >" not in wrapped
+        assert env._safe_state_path in wrapped
         assert env._cwd_marker in wrapped
         assert "exit $__hermes_ec" in wrapped
 
-    def test_no_snapshot_skips_source(self):
+    def test_no_safe_state_skips_codec(self):
         env = _TestableEnv()
-        env._snapshot_ready = False
+        env._safe_state_ready = False
         wrapped = env._wrap_command("echo hello", "/tmp")
 
-        assert "source" not in wrapped
+        assert env._safe_state_path not in wrapped
+        assert "_hss_apply" not in wrapped
+        assert "_hss_capture" not in wrapped
 
     def test_single_quote_escaping(self):
         env = _TestableEnv()
-        env._snapshot_ready = True
+        env._safe_state_ready = True
         wrapped = env._wrap_command("echo 'hello world'", "/tmp")
 
         assert "eval 'echo '\\''hello world'\\'''" in wrapped
 
-
     def test_cd_failure_exit_126(self):
         env = _TestableEnv()
-        env._snapshot_ready = True
+        env._safe_state_ready = True
         wrapped = env._wrap_command("ls", "/nonexistent")
 
         assert "exit 126" in wrapped
 
 
-class TestAtomicSnapshotWrite:
-    """Regression for #38249: concurrent terminal calls in one session both
-    source AND rewrite the shared env snapshot. A non-atomic ``export -p >
-    snap`` truncates-then-writes in place, so a concurrent ``source snap`` can
-    read a half-written file and embed ``declare -x``/``export`` fragments into
-    PATH, breaking ``ls``/``git``/``tr`` with command-not-found. The write must
-    assemble in a temp file and ``mv -f`` it into place (mv is atomic on POSIX
-    same-fs), so a reader sees the old-or-new complete file, never a torn one.
-    """
-
+class TestAtomicSafeStateWrite:
     def test_wrap_command_uses_atomic_temp_then_mv(self):
         env = _TestableEnv()
-        env._snapshot_ready = True
+        env._safe_state_ready = True
+
         wrapped = env._wrap_command("echo hi", "/tmp")
-        # Env dump goes to a temp file, not directly over the live snapshot.
-        assert "export -p" in wrapped and "> " in wrapped
-        assert ".tmp." in wrapped
-        # Then an atomic rename onto the real snapshot path.
+
+        assert "export -p" not in wrapped
+        assert "source " not in wrapped
+        assert "mktemp " in wrapped
+        assert ".tmp.XXXXXXXXXX" in wrapped
         assert "mv -f " in wrapped
-        # The env-dump must NOT write the live snapshot in place (the bug).
-        snap = env._snapshot_path
-        assert f"> {snap} " not in wrapped
-        assert f"> '{snap}'" not in wrapped
-        assert f"> {snap}\n" not in wrapped
+        assert env._safe_state_path in wrapped
 
     def test_temp_path_uses_mktemp_not_pid_variables(self):
-        """The temp name MUST be allocated by ``mktemp`` — never ``$$`` (in
-        ``&``-launched concurrent subshells it stays the parent shell's PID, so
-        two writers would pick the same temp name and publish a torn file) and
-        never ``$BASHPID`` (macOS ships bash 3.2, which lacks it — the name
-        expands empty, collapsing every writer onto one temp path and
-        reopening the #38249 race).  Regression for PR #54314."""
         env = _TestableEnv()
-        env._snapshot_ready = True
+        env._safe_state_ready = True
+
         wrapped = env._wrap_command("echo hi", "/tmp")
+
         assert "mktemp " in wrapped
         assert ".tmp.XXXXXXXXXX" in wrapped
         assert "$BASHPID" not in wrapped
-        # The bare $$ temp form must be gone.
         assert ".tmp.$$" not in wrapped
 
-
     def test_init_session_bootstrap_also_atomic_and_mktemp(self):
-        """The init_session bootstrap (first snapshot write) is the same shared
-        file a concurrent command could source — it must be atomic and use
-        ``mktemp`` too (no ``$BASHPID``: absent on macOS bash 3.2)."""
         env = _TestableEnv()
         captured = {}
 
         def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None):
-            captured.setdefault("cmd", cmd_string)  # only the bootstrap; ignore the failure-path probe
+            captured.setdefault("cmd", cmd_string)
             raise RuntimeError("stop after capture")
 
         env._run_bash = fake_run_bash  # type: ignore[assignment]
-        try:
-            env.init_session()
-        except Exception:
-            pass
+        env.init_session()
+
         boot = captured.get("cmd", "")
-        assert ".tmp." in boot and "mv -f " in boot, boot
+        assert ".tmp.XXXXXXXXXX" in boot
         assert "mktemp " in boot
+        assert "mv -f " in boot
         assert "$BASHPID" not in boot
         assert ".tmp.$$" not in boot
-
+        assert "export -p" not in boot
+        assert "source " not in boot
 
     def test_init_session_bootstrap_uses_private_umask(self):
         env = _TestableEnv()
         captured = {}
 
         def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None):
-            captured.setdefault("cmd", cmd_string)  # only the bootstrap; ignore the failure-path probe
+            captured.setdefault("cmd", cmd_string)
             raise RuntimeError("stop after capture")
 
         env._run_bash = fake_run_bash  # type: ignore[assignment]
-        try:
-            env.init_session()
-        except Exception:
-            pass
+        env.init_session()
+
         boot = captured.get("cmd", "")
         assert "umask 077" in boot
-        assert boot.index("umask 077") < boot.index("export -p")
-
-
-class TestAtomicSnapshotConcurrencyBehavioral:
-    """Behavioral regression for #38249 — actually EXECUTES the generated
-    snapshot write/read concurrently and asserts the file never tears.
-
-    The string-inspection tests prove the right script is emitted; this proves
-    the emitted script's guarantee holds under real concurrency: N concurrent
-    writers + readers, and the snapshot is ALWAYS a complete, parseable env
-    dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
-    that would corrupt PATH.  Crucially it allocates the temp with ``mktemp``
-    (per-writer unique, works on macOS bash 3.2 which lacks ``$BASHPID``),
-    which is what closes the race; ``$$`` would still tear here.
-    """
-
-    def _run(self, script):
-        import subprocess
-        return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True)
-
-    def test_concurrent_writes_never_tear_the_snapshot(self, tmp_path):
-        import shutil
-        if not shutil.which("bash"):
-            import pytest
-            pytest.skip("bash required")
-        import shlex
-        snap = str(tmp_path / "hermes-snap-x.sh")
-        _q = shlex.quote
-        _tmpl = _q(snap + ".tmp.XXXXXXXXXX")
-        # One writer iteration = the exact atomic sequence _wrap_command emits.
-        writer = (
-            "for i in $(seq 1 80); do "
-            "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"__hermes_snap_tmp=$(mktemp {_tmpl}) && "
-            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} "
-            f"2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true; "
-            "done"
-        )
-        # Reader: repeatedly source the snapshot and check PATH never absorbs
-        # an `export `/`declare -x` fragment (the corruption signature).
-        reader = (
-            "export PATH=/usr/bin:/bin; "
-            "for i in $(seq 1 160); do "
-            f"( source {_q(snap)} >/dev/null 2>&1 || true; "
-            "case \"$PATH\" in *'declare -x'*|*'export '*) echo CORRUPT;; esac ); "
-            "done"
-        )
-        self._run(f"export -p > {_q(snap)}")  # seed a valid snapshot
-        # 4 concurrent writers + 4 readers, repeated.
-        w = " & ".join([writer] * 4)
-        r = " & ".join([reader] * 4)
-        procs = [self._run(f"{w} & {r} & wait") for _ in range(3)]
-        corrupt = any("CORRUPT" in p.stdout for p in procs)
-        assert not corrupt, "snapshot tore — PATH absorbed a declare-x/export fragment"
-        final = self._run(f"source {_q(snap)} >/dev/null 2>&1 && echo OK || echo BROKEN")
-        assert "OK" in final.stdout, f"final snapshot not sourceable: {final.stdout} {final.stderr}"
-
-    def test_failed_export_does_not_destroy_good_snapshot(self, tmp_path):
-        """If ``export -p`` fails, the ``&&``-chained mv must NOT clobber the
-        existing good snapshot."""
-        import shutil
-        if not shutil.which("bash"):
-            import pytest
-            pytest.skip("bash required")
-        import shlex
-        snap = str(tmp_path / "snap.sh")
-        _q = shlex.quote
-        self._run(f"echo 'export GOOD=1' > {_q(snap)}")  # seed good snapshot
-        # Redirect export into an unwritable dir so the export side fails; mv
-        # must then NOT run (&&) and not clobber snap.
-        bad_tmp = _q("/nonexistent-dir/snap.tmp.XXXXXXXXXX")
-        script = (
-            f"__hermes_snap_tmp=$(mktemp {bad_tmp}) && "
-            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} "
-            f"2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true"
-        )
-        self._run(script)
-        out = self._run(f"cat {_q(snap)}")
-        assert "export GOOD=1" in out.stdout, "good snapshot was destroyed by a failed export"
-
-
-class TestSnapshotFileModes:
-    """Snapshot metadata files are private without changing user command umask."""
-
-    def test_snapshot_and_cwd_files_are_0600(self, tmp_path):
-        import os
-        from pathlib import Path
-        import shutil
-        import stat
-        import subprocess
-        if not shutil.which("bash"):
-            import pytest
-            pytest.skip("bash required")
-
-        class ExecutableEnv(BaseEnvironment):
-            def __init__(self, temp_dir):
-                self._temp_dir = str(temp_dir)
-                super().__init__(cwd=str(temp_dir), timeout=10)
-
-            def get_temp_dir(self):
-                return self._temp_dir
-
-            def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
-                proc = subprocess.Popen(
-                    ["/bin/bash", "-lc", cmd_string],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    text=True,
-                    cwd=self.cwd,
-                )
-                proc.communicate(timeout=timeout)
-                return proc
-
-            def cleanup(self):
-                pass
-
-        old_umask = os.umask(0o022)
-        try:
-            env = ExecutableEnv(tmp_path)
-            env.init_session()
-
-            user_file = tmp_path / "user-created.txt"
-            env.execute(f"touch {user_file}")
-
-            assert stat.S_IMODE(user_file.stat().st_mode) == 0o644
-            assert stat.S_IMODE(Path(env._snapshot_path).stat().st_mode) == 0o600
-            # The cwd temp file is no longer written (cwd travels via the
-            # stdout marker for every backend) — nothing to leak on disk.
-            assert not Path(env._cwd_file).exists()
-        finally:
-            os.umask(old_umask)
+        assert "export -p" not in boot
 
 
 class TestExtractCwdFromOutput:
@@ -348,7 +196,7 @@ class TestEmbedStdinHeredoc:
 
 
 class TestInitSessionFailure:
-    def test_snapshot_ready_false_on_failure(self):
+    def test_safe_state_ready_false_on_failure(self):
         env = _TestableEnv()
 
         def failing_run_bash(*args, **kwargs):
@@ -357,11 +205,11 @@ class TestInitSessionFailure:
         env._run_bash = failing_run_bash
         env.init_session()
 
-        assert env._snapshot_ready is False
-
+        assert env._safe_state_ready is False
+        assert env._safe_state_disabled_reason == "init_failed"
 
     def test_prefer_nonlogin_when_login_bash_is_dead(self):
-        """Login snapshot failure + working non-login probe → don't use bash -l."""
+        """Safe-state init failure keeps the working non-login Bash fallback."""
         env = _TestableEnv()
 
         def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
@@ -377,7 +225,8 @@ class TestInitSessionFailure:
         env._run_bash = mock_run_bash
         env.init_session()
 
-        assert env._snapshot_ready is False
+        assert env._safe_state_ready is False
+        assert env._safe_state_disabled_reason == "init_failed"
         assert env._prefer_nonlogin is True
 
         calls = []
@@ -405,3 +254,102 @@ class TestCwdMarker:
         env1 = _TestableEnv()
         env2 = _TestableEnv()
         assert env1._cwd_marker != env2._cwd_marker
+
+
+class TestSafeTerminalStateContract:
+    def test_constructor_uses_versioned_non_executable_state_path(self):
+        env = _TestableEnv()
+
+        assert "hermes-safe-state-" in env._safe_state_path
+        assert env._safe_state_path.endswith(".v1")
+        assert env._safe_state_ready is False
+        assert env._safe_state_disabled_reason is None
+        assert not hasattr(env, "_snapshot_path")
+        assert not hasattr(env, "_snapshot_ready")
+
+    def test_wrap_command_never_sources_or_dumps_environment(self):
+        env = _TestableEnv()
+        env._safe_state_ready = True
+
+        wrapped = env._wrap_command("echo hello", "/tmp")
+
+        for forbidden in ("source ", "export -p", "declare -x"):
+            assert forbidden not in wrapped
+        assert "eval 'echo hello'" in wrapped
+        assert f"eval '{env._safe_state_path}'" not in wrapped
+        assert env._cwd_marker in wrapped
+        assert env._safe_state_path in wrapped
+
+    def test_init_session_never_builds_full_environment_dump(self):
+        env = _TestableEnv()
+        captured = []
+
+        def capture_and_fail(cmd, **kwargs):
+            captured.append(cmd)
+            raise RuntimeError("stop after capture")
+
+        env._run_bash = capture_and_fail  # type: ignore[assignment]
+        env.init_session()
+
+        assert captured
+        for forbidden in ("source ", "eval ", "export -p", "declare -x"):
+            assert forbidden not in captured[0]
+        assert env._safe_state_path in captured[0]
+
+    def test_multiplex_mode_disables_state_before_bootstrap(self, monkeypatch):
+        from agent import secret_scope
+
+        env = _TestableEnv()
+        calls = []
+        monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: True)
+
+        def unexpected_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise RuntimeError("must not run")
+
+        env._run_bash = unexpected_run  # type: ignore[assignment]
+        env.init_session()
+
+        assert calls == []
+        assert env._safe_state_ready is False
+        assert env._safe_state_disabled_reason == "multiplex_mode"
+
+    def test_disable_safe_state_warns_once_without_values(self, caplog):
+        env = _TestableEnv()
+        caplog.set_level(logging.WARNING)
+
+        env._disable_safe_state("codec_unavailable")
+        env._disable_safe_state("codec_unavailable")
+
+        matching = [
+            record for record in caplog.records
+            if "codec_unavailable" in record.getMessage()
+        ]
+        assert len(matching) == 1
+        assert "synthetic-secret-value" not in caplog.text
+
+    def test_state_failure_marker_disables_and_is_removed_from_output(self, caplog):
+        env = _TestableEnv()
+        env._safe_state_ready = True
+        caplog.set_level(logging.WARNING)
+        marker = env._safe_state_marker
+        result = {
+            "output": f"before\n{marker}apply_invalid{marker}\nafter\n",
+        }
+
+        env._extract_safe_state_status(result)
+
+        assert env._safe_state_ready is False
+        assert env._safe_state_disabled_reason == "apply_invalid"
+        assert marker not in result["output"]
+        assert "before" in result["output"]
+        assert "after" in result["output"]
+
+    def test_legacy_snapshot_file_is_never_referenced(self):
+        env = _TestableEnv()
+        env._safe_state_ready = True
+
+        wrapped = env._wrap_command("true", "/tmp")
+
+        assert "hermes-snap-" not in wrapped
+        assert ".sh" not in env._safe_state_path

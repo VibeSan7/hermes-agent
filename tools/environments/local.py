@@ -1643,10 +1643,10 @@ def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
 
 
 def _resolve_shell_init_files() -> list[str]:
-    """Resolve the list of files to source before the login-shell snapshot.
+    """Resolve files to source before the login-shell safe-state bootstrap.
 
     Expands ``~`` and ``${VAR}`` references and drops anything that doesn't
-    exist on disk, so a missing ``~/.bashrc`` never breaks the snapshot.
+    exist on disk, so a missing ``~/.bashrc`` never breaks safe-state setup.
     The ``auto_source_bashrc`` path runs only when the user hasn't supplied
     an explicit list — once they have, Hermes trusts them.
     """
@@ -1658,7 +1658,7 @@ def _resolve_shell_init_files() -> list[str]:
     elif auto_bashrc and not _IS_WINDOWS:
         # Build a login-shell-ish source list so tools like n / nvm / asdf /
         # pyenv that self-install into the user's shell rc land on PATH in
-        # the captured snapshot.
+        # the captured safe runtime state.
         #
         # ~/.profile and ~/.bash_profile run first because they have no
         # interactivity guard — installers like ``n`` and ``nvm`` append
@@ -1709,11 +1709,9 @@ class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host machine.
 
     Spawn-per-call: every execute() spawns a fresh bash process.
-    Session snapshot preserves env vars across calls.
-    CWD persists via file-based read after each command.
+    Default-deny safe state preserves Python/Conda runtime markers.
+    CWD persists through the shared in-band stdout marker.
     """
-
-    _profile_scoped_passthrough = True
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
@@ -1773,20 +1771,18 @@ class LocalEnvironment(BaseEnvironment):
         """Use native paths for Python, but Git Bash-friendly paths for cd."""
         return BaseEnvironment._quote_cwd_for_cd(_windows_to_msys_path(cwd))
 
-    def _quote_shell_path(self, path: str) -> str:
-        """Rewrite native/mixed Windows paths before quoting for Git Bash."""
-        return _quote_bash_path(path)
+    def _safe_state_shell_path(self, path: str) -> str:
+        """Rewrite the safe-state path into the target Bash namespace."""
+        return _bash_safe_path(path)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
-        # For login-shell invocations (used by init_session to build the
-        # environment snapshot), prepend sources for the user's bashrc /
-        # custom init files so tools registered outside bash_profile
-        # (nvm, asdf, pyenv, …) end up on PATH in the captured snapshot.
-        # Non-login invocations are already sourcing the snapshot and
-        # don't need this.
+        # Login-shell invocations initialize safe runtime state. Source the
+        # user's configured shell init files so nvm/asdf/pyenv PATH changes are
+        # available to the code-defined allowlist capture. Non-login commands
+        # apply validated safe state instead.
         if login:
             init_files = _resolve_shell_init_files()
             if init_files:
@@ -1965,17 +1961,16 @@ class LocalEnvironment(BaseEnvironment):
                 result.pop("cwd_observed", None)
 
     def cleanup(self):
-        """Clean up temp files."""
-        for f in (self._snapshot_path, self._cwd_file):
+        """Clean up safe-state files and interrupted publication temps."""
+        for f in (self._safe_state_path, self._cwd_file):
             try:
                 os.unlink(f)
             except OSError:
                 pass
-        # Remove any orphaned atomic-write temp snapshots (snap.tmp.<bashpid>)
-        # a failed/interrupted mv could have left behind (#38249).
+        # Remove orphaned per-writer temp files left by interrupted publication.
         try:
             import glob
-            for tmp in glob.glob(f"{self._snapshot_path}.tmp.*"):
+            for tmp in glob.glob(f"{self._safe_state_path}.tmp.*"):
                 try:
                     os.unlink(tmp)
                 except OSError:
