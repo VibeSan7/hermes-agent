@@ -531,6 +531,9 @@ class BaseEnvironment(ABC):
     interrupt handling, and timeout enforcement.
     """
 
+    # Backends opt in only after proving the v1 file-security contract.
+    _safe_state_persistence_supported: bool = False
+
     # Backends choose pipe, heredoc, or inline process-substitution stdin.
     _stdin_mode: str = "pipe"
 
@@ -639,6 +642,9 @@ class BaseEnvironment(ABC):
             return
         if is_multiplex_active():
             self._disable_safe_state("multiplex_mode")
+            return
+        if not self._safe_state_persistence_supported:
+            self._disable_safe_state("unsupported_backend")
             return
 
         try:

@@ -219,6 +219,12 @@ terminal:
 
 See the [Security guide](/user-guide/security#environment-variable-passthrough) for full details.
 
+Passthrough is invocation-local: allowing a variable gives the current
+`execute_code` or `terminal` invocation access to it, but does not make it part
+of terminal state. Do not rely on `export` or a credential passthrough value
+surviving into a later command. Terminal state persists only the documented,
+validated Python/Conda runtime allowlist where the backend supports it.
+
 ### `HERMES_*` variables in the child
 
 The child process receives only a small, fixed set of operational `HERMES_*`

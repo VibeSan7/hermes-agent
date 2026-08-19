@@ -861,6 +861,8 @@ class DockerEnvironment(BaseEnvironment):
     across container restarts.
     """
 
+    _safe_state_persistence_supported = True
+
     def __init__(
         self,
         image: str,

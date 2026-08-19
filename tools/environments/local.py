@@ -1819,6 +1819,7 @@ class LocalEnvironment(BaseEnvironment):
     CWD persists through the shared in-band stdout marker.
     """
 
+    _safe_state_persistence_supported = True
     _stdin_mode = "inline" if _IS_WINDOWS else "pipe"
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):

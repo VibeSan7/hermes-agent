@@ -237,10 +237,10 @@ class TestPersistentSSH:
         assert r["exit_code"] == 0
         assert "hello-persistent" in r["output"]
 
-    def test_env_var_persists(self):
+    def test_arbitrary_env_var_does_not_persist(self):
         _run("export HERMES_PERSIST_TEST=works")
         r = _run("echo $HERMES_PERSIST_TEST")
-        assert r["output"].strip() == "works"
+        assert r["output"].strip() == ""
 
 
     def test_large_output(self):

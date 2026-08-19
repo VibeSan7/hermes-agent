@@ -168,8 +168,8 @@ class ModalEnvironment(BaseEnvironment):
     cancel_fn wired to sandbox.terminate for interrupt support.
     """
 
+    _safe_state_persistence_supported = False
     _stdin_mode = "heredoc"
-    _snapshot_timeout = 60  # Modal cold starts can be slow
 
     def __init__(
         self,

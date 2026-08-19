@@ -47,10 +47,12 @@ class SSHEnvironment(BaseEnvironment):
     """Run commands on a remote machine over SSH.
 
     Spawn-per-call: every execute() spawns a fresh ``ssh ... bash -c`` process.
-    Session snapshot preserves env vars across calls.
+    Terminal env state is off until SSH can prove the v1 remote file contract.
     CWD persists via in-band stdout markers.
     Uses SSH ControlMaster for connection reuse.
     """
+
+    _safe_state_persistence_supported = False
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = ""):

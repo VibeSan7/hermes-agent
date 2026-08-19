@@ -162,9 +162,11 @@ class SingularityEnvironment(BaseEnvironment):
     """Hardened Singularity/Apptainer container with resource limits and persistence.
 
     Spawn-per-call: every execute() spawns a fresh ``apptainer exec ... bash -c`` process.
-    Session snapshot preserves env vars across calls.
+    Terminal env state is off until the instance proves the v1 file contract.
     CWD persists via in-band stdout markers.
     """
+
+    _safe_state_persistence_supported = False
 
     def __init__(
         self,

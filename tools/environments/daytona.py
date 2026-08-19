@@ -10,7 +10,7 @@ import math
 import os
 import shlex
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from tools.environments.base import (
     BaseEnvironment,
@@ -34,6 +34,8 @@ class DaytonaEnvironment(BaseEnvironment):
     cancel_fn wired to sandbox.stop() for interrupt support.
     Shell timeout wrapper preserved (SDK timeout unreliable).
     """
+
+    _safe_state_persistence_supported = False
 
     _stdin_mode = "heredoc"
 
@@ -153,7 +155,7 @@ class DaytonaEnvironment(BaseEnvironment):
 
     def _daytona_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via Daytona SDK."""
-        parent = str(Path(remote_path).parent)
+        parent = str(PurePosixPath(remote_path).parent)
         self._sandbox.process.exec(quoted_mkdir_command([parent]))
         self._sandbox.fs.upload_file(host_path, remote_path)
 

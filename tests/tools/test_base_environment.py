@@ -15,6 +15,8 @@ from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
 class _TestableEnv(BaseEnvironment):
     """Concrete subclass for testing base class methods."""
 
+    _safe_state_persistence_supported = True
+
     def __init__(self, cwd="/tmp", timeout=10):
         super().__init__(cwd=cwd, timeout=timeout)
 

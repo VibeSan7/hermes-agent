@@ -243,6 +243,7 @@ class _SandboxCreateParams:
 class VercelSandboxEnvironment(BaseEnvironment):
     """Vercel cloud sandbox backend."""
 
+    _safe_state_persistence_supported = False
     _stdin_mode = "heredoc"
 
     def __init__(

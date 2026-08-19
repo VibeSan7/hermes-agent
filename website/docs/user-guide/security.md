@@ -551,6 +551,20 @@ terminal:
     - ANOTHER_TOKEN
 ```
 
+### Passthrough Lifetime and Terminal State
+
+`terminal.env_passthrough` values and skill-declared environment variables are
+injected for the current invocation only. They are never written into terminal
+state, so a later command must receive them through passthrough again.
+
+Terminal state is default-deny. In single-profile mode, only the fixed
+Python/Conda runtime allowlist (`PATH`, `VIRTUAL_ENV`, `CONDA_PREFIX`,
+`CONDA_DEFAULT_ENV`, `CONDA_SHLVL`, `CONDA_EXE`, `CONDA_PYTHON_EXE`, `_CE_CONDA`,
+and `_CE_M`) may persist after validation. Arbitrary exports, credentials,
+aliases, and shell functions do not persist. Multi-profile multiplex mode and
+backends that cannot prove the state-file security contract run with terminal
+environment persistence off.
+
 ### Credential File Passthrough (OAuth tokens, etc.) {#credential-file-passthrough}
 
 Some skills need **files** (not just env vars) in the sandbox — for example, Google Workspace stores OAuth tokens as `google_token.json` under the active profile's `HERMES_HOME`. Skills declare these in frontmatter:

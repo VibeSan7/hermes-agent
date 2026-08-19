@@ -59,6 +59,7 @@ def daytona_sdk(monkeypatch):
 @pytest.fixture()
 def make_env(daytona_sdk, monkeypatch):
     """Factory that creates a DaytonaEnvironment with a mocked SDK."""
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     # Prevent is_interrupted from interfering — patch where it's used (base.py)
     monkeypatch.setattr("tools.environments.base.is_interrupted", lambda: False)
     # Prevent skills/credential sync from consuming mock exec calls
@@ -172,10 +173,9 @@ class TestCleanup:
 class TestExecute:
     def test_basic_command(self, make_env):
         sb = _make_sandbox()
-        # Calls: (1) $HOME detection, (2) init_session bootstrap, (3) actual command
+        # Calls: (1) $HOME detection, (2) actual command. Terminal env state is off.
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),       # $HOME
-            _make_exec_response(result="", exit_code=0),  # init_session
             _make_exec_response(result="hello", exit_code=0),  # actual cmd
         ]
         sb.state = "started"
@@ -191,9 +191,7 @@ class TestExecute:
         sb.state = "started"
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),  # $HOME
-            _make_exec_response(result="", exit_code=0),  # init_session
-            daytona_sdk.DaytonaError("transient"),  # first attempt fails
-            _make_exec_response(result="ok", exit_code=0),  # retry succeeds
+            daytona_sdk.DaytonaError("transient"),  # actual command fails
         ]
         env = make_env(sandbox=sb)
 
@@ -238,8 +236,6 @@ class TestInterrupt:
             calls["n"] += 1
             if calls["n"] == 1:
                 return _make_exec_response(result="/root")  # $HOME detection
-            if calls["n"] == 2:
-                return _make_exec_response(result="", exit_code=0)  # init_session
             event.wait(timeout=5)  # simulate long-running command
             return _make_exec_response(result="done", exit_code=0)
 
@@ -270,7 +266,6 @@ class TestRetryExhausted:
         sb.state = "started"
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),       # $HOME
-            _make_exec_response(result="", exit_code=0),  # init_session
             daytona_sdk.DaytonaError("fail1"),         # actual command fails
         ]
         env = make_env(sandbox=sb)
