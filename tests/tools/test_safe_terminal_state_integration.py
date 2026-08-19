@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -91,6 +92,99 @@ def test_deactivate_clears_stale_venv_and_path(tmp_path, monkeypatch):
     assert ".venv" not in path_value
 
 
+def test_conda_markers_persist_and_deactivate(tmp_path, monkeypatch):
+    env = _new_env(tmp_path, monkeypatch)
+    root = (
+        local._windows_to_msys_path(str(tmp_path))
+        if sys.platform == "win32"
+        else str(tmp_path)
+    )
+    prefix = f"{root}/conda-env"
+    conda_exe = f"{root}/miniconda/Scripts/conda.exe"
+    conda_python = f"{root}/miniconda/python.exe"
+    activate = (
+        f"export CONDA_PREFIX='{prefix}' CONDA_DEFAULT_ENV=demo CONDA_SHLVL=1 "
+        f"CONDA_EXE='{conda_exe}' CONDA_PYTHON_EXE='{conda_python}' "
+        "_CE_CONDA= _CE_M=; "
+        f"export PATH='{prefix}/Scripts':\"$PATH\""
+    )
+    try:
+        activated = env.execute(activate)
+        state = decode_safe_state(
+            Path(env._safe_state_path).read_bytes(),
+            platform="msys" if sys.platform == "win32" else "posix",
+        )
+        values = dict(state.records)
+
+        deactivated = env.execute(
+            "unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_SHLVL CONDA_EXE "
+            "CONDA_PYTHON_EXE _CE_CONDA _CE_M; "
+            'export PATH="${PATH#*:}"'
+        )
+        cleared = decode_safe_state(
+            Path(env._safe_state_path).read_bytes(),
+            platform="msys" if sys.platform == "win32" else "posix",
+        )
+        observed = env.execute(
+            "printf '%s|%s' \"${CONDA_PREFIX-unset}\" \"$PATH\""
+        )
+    finally:
+        env.cleanup()
+
+    assert activated["returncode"] == 0
+    assert values["CONDA_PREFIX"] == prefix
+    assert values["CONDA_DEFAULT_ENV"] == "demo"
+    assert values["CONDA_SHLVL"] == "1"
+    assert values["CONDA_EXE"] == conda_exe
+    assert values["CONDA_PYTHON_EXE"] == conda_python
+    assert f"{prefix}/Scripts" in values["PATH"]
+    assert deactivated["returncode"] == 0
+    cleared_values = dict(cleared.records)
+    for name in (
+        "CONDA_PREFIX",
+        "CONDA_DEFAULT_ENV",
+        "CONDA_SHLVL",
+        "CONDA_EXE",
+        "CONDA_PYTHON_EXE",
+        "_CE_CONDA",
+        "_CE_M",
+    ):
+        assert cleared_values[name] is None
+    assert prefix not in cleared_values["PATH"]
+    observed_prefix, observed_path = observed["output"].split("|", 1)
+    assert observed_prefix == "unset"
+    assert prefix not in observed_path
+
+
+def test_user_failure_exit_code_survives_state_capture(tmp_path, monkeypatch):
+    env = _new_env(tmp_path, monkeypatch)
+    try:
+        result = env.execute("printf command-failed; false")
+    finally:
+        env.cleanup()
+
+    assert result["returncode"] == 1
+    assert result["output"].strip() == "command-failed"
+    assert env._safe_state_ready is True
+
+
+def test_malformed_state_fails_closed_but_command_still_runs(tmp_path, monkeypatch):
+    env = _new_env(tmp_path, monkeypatch)
+    Path(env._safe_state_path).write_text(
+        "HERMES_SAFE_TERMINAL_STATE\t1\nBROKEN\n",
+        encoding="utf-8",
+    )
+    try:
+        result = env.execute("printf command-ok")
+    finally:
+        env.cleanup()
+
+    assert result["returncode"] == 0
+    assert result["output"].strip() == "command-ok"
+    assert env._safe_state_ready is False
+    assert env._safe_state_disabled_reason.startswith("apply_")
+
+
 def test_malformed_config_cannot_widen_persistence(tmp_path, monkeypatch):
     home = tmp_path / "hermes-home"
     home.mkdir()
@@ -114,7 +208,7 @@ def test_malformed_config_cannot_widen_persistence(tmp_path, monkeypatch):
 def test_ten_synthetic_credentials_never_enter_safe_state(tmp_path, monkeypatch):
     env = _new_env(tmp_path, monkeypatch)
     assignments = " ".join(
-        f"export {name}=synthetic-{index}" 
+        f"export {name}=synthetic-{index}"
         for index, name in enumerate(SYNTHETIC_CREDENTIAL_NAMES)
     )
     try:
@@ -168,19 +262,116 @@ def test_reparse_or_symlink_state_artifact_is_rejected(tmp_path, monkeypatch):
     state = Path(env._safe_state_path)
     target = tmp_path / "target-state"
     target.write_text("synthetic", encoding="utf-8")
+    junction = False
     try:
         try:
             state.symlink_to(target)
-        except OSError as exc:
-            pytest.skip(f"symlink unavailable: {exc}")
+        except OSError as symlink_error:
+            if sys.platform != "win32":
+                pytest.skip(f"symlink unavailable: {symlink_error}")
+            target.unlink()
+            target.mkdir()
+            created = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(state), str(target)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if created.returncode != 0:
+                pytest.skip(
+                    "symlink and junction unavailable: "
+                    f"symlink={symlink_error}; junction_rc={created.returncode}"
+                )
+            junction = True
         valid, reason = env._prepare_safe_state_artifact()
     finally:
-        state.unlink(missing_ok=True)
-        target.unlink(missing_ok=True)
+        if junction:
+            try:
+                os.rmdir(state)
+            except OSError:
+                pass
+            try:
+                target.rmdir()
+            except OSError:
+                pass
+        else:
+            state.unlink(missing_ok=True)
+            if target.is_dir():
+                target.rmdir()
+            else:
+                target.unlink(missing_ok=True)
         env.cleanup()
 
     assert valid is False
     assert reason == "reparse"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode contract")
+def test_posix_state_modes_are_private_without_changing_user_umask(
+    tmp_path, monkeypatch
+):
+    import stat
+
+    env = _new_env(tmp_path, monkeypatch)
+    try:
+        user_file = tmp_path / "user-created.txt"
+        result = env.execute(f"touch '{user_file}'")
+        state_mode = stat.S_IMODE(Path(env._safe_state_path).stat().st_mode)
+        directory_mode = stat.S_IMODE(Path(env.get_temp_dir()).stat().st_mode)
+        user_mode = stat.S_IMODE(user_file.stat().st_mode)
+    finally:
+        env.cleanup()
+
+    assert result["returncode"] == 0
+    assert state_mode == 0o600
+    assert directory_mode == 0o700
+    assert user_mode == 0o644
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows ACL contract")
+def test_windows_insecure_preexisting_target_is_rejected_before_bootstrap(
+    tmp_path, monkeypatch
+):
+    import ntsecuritycon
+    import win32security
+
+    with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
+        env = _new_env(tmp_path, monkeypatch)
+    state = Path(env._safe_state_path)
+    state.write_text("synthetic", encoding="utf-8")
+    everyone = win32security.ConvertStringSidToSid("S-1-1-0")
+    dacl = win32security.ACL()
+    dacl.AddAccessAllowedAceEx(
+        win32security.ACL_REVISION,
+        0,
+        ntsecuritycon.FILE_ALL_ACCESS,
+        everyone,
+    )
+    win32security.SetNamedSecurityInfo(
+        str(state),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        dacl,
+        None,
+    )
+    calls = []
+
+    def unexpected_bootstrap(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError("preflight must reject before bootstrap")
+
+    env._run_bash = unexpected_bootstrap
+
+    try:
+        env.init_session()
+    finally:
+        env.cleanup()
+
+    assert calls == []
+    assert env._safe_state_ready is False
+    assert env._safe_state_disabled_reason == "acl"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows ACL contract")

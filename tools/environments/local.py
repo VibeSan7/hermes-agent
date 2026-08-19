@@ -1902,6 +1902,35 @@ class LocalEnvironment(BaseEnvironment):
             return False, "permissions"
         return True, ""
 
+    def _prepare_safe_state_target(self) -> tuple[bool, str]:
+        path = Path(self._safe_state_path)
+        try:
+            expected_parent = Path(self.get_temp_dir()).resolve(strict=True)
+            if path.parent.resolve(strict=True) != expected_parent:
+                return False, "outside_private_cache"
+            info = path.lstat()
+        except FileNotFoundError:
+            return True, ""
+        except OSError:
+            return False, "stat_failed"
+
+        attributes = getattr(info, "st_file_attributes", 0)
+        if stat.S_ISLNK(info.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
+            return False, "reparse"
+        if not stat.S_ISREG(info.st_mode):
+            return False, "non_regular"
+        if info.st_nlink != 1:
+            return False, "hardlink"
+        try:
+            if _IS_WINDOWS:
+                if not _windows_acl_is_private(path):
+                    return False, "acl"
+            elif stat.S_IMODE(info.st_mode) != 0o600:
+                return False, "mode"
+        except Exception:
+            return False, "permissions"
+        return True, ""
+
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:

@@ -2,6 +2,7 @@ import logging
 import os
 from io import StringIO
 import subprocess
+import sys
 
 import pytest
 
@@ -356,6 +357,68 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
             assert not (tmp_path / "safe-state.v1").exists()
     finally:
         ss.set_multiplex_active(False)
+
+
+def test_single_profile_docker_uses_safe_state(monkeypatch, tmp_path):
+    from agent import secret_scope as ss
+    from tools.environments.local import _find_bash, _windows_to_msys_path
+
+    env = _make_execute_only_env()
+    env.cwd = "/"
+    state_native = tmp_path / "docker-safe-state.v1"
+    env._safe_state_path = (
+        _windows_to_msys_path(str(state_native))
+        if sys.platform == "win32"
+        else str(state_native)
+    )
+    env._safe_state_ready = False
+    env._safe_state_disabled_reason = None
+    env._safe_state_warning_emitted = False
+
+    def _run_fake_docker_exec(cmd, stdin_data=None):
+        container_index = cmd.index(env._container_id)
+        child_env = os.environ.copy()
+        index = 2
+        while index < container_index:
+            assert cmd[index] == "-e"
+            key, value = cmd[index + 1].split("=", 1)
+            child_env[key] = value
+            index += 2
+        shell_args = cmd[container_index + 1 :]
+        assert shell_args[:1] == ["bash"]
+        script = shell_args[-1]
+        return subprocess.Popen(
+            [_find_bash(), "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=child_env,
+        )
+
+    monkeypatch.setattr(docker_env, "_popen_bash", _run_fake_docker_exec)
+    ss.set_multiplex_active(False)
+    venv_path = (
+        _windows_to_msys_path(str(tmp_path / "venv"))
+        if sys.platform == "win32"
+        else str(tmp_path / "venv")
+    )
+    try:
+        env.init_session()
+        activated = env.execute(
+            f"export VIRTUAL_ENV='{venv_path}'; "
+            f"export PATH='{venv_path}/bin':\"$PATH\""
+        )
+        observed = env.execute("printf '%s' \"${VIRTUAL_ENV-unset}\"")
+    finally:
+        state_native.unlink(missing_ok=True)
+
+    assert env._safe_state_ready is True
+    assert activated["returncode"] == 0
+    assert observed["returncode"] == 0
+    assert observed["output"] == venv_path
 
 
 def test_multiplexed_docker_init_never_starts_safe_state(tmp_path):

@@ -618,6 +618,10 @@ class BaseEnvironment(ABC):
         """Validate backend-specific file identity before state use."""
         return True, ""
 
+    def _prepare_safe_state_target(self) -> tuple[bool, str]:
+        """Validate a pre-existing canonical target before replacement."""
+        return True, ""
+
     def _disable_safe_state(self, reason_code: str) -> None:
         self._safe_state_ready = False
         if self._safe_state_disabled_reason is None:
@@ -645,6 +649,15 @@ class BaseEnvironment(ABC):
             return
         if not self._safe_state_persistence_supported:
             self._disable_safe_state("unsupported_backend")
+            return
+
+        try:
+            valid, reason = self._prepare_safe_state_target()
+        except Exception:
+            self._disable_safe_state("target_check_failed")
+            return
+        if not valid:
+            self._disable_safe_state(reason)
             return
 
         try:
