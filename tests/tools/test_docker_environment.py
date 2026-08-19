@@ -163,14 +163,19 @@ def _make_execute_only_env(forward_env=None):
     env._timeout_result = lambda timeout: {"output": f"timed out after {timeout}", "returncode": 124}
     env._container_id = "test-container"
     env._docker_exe = "/usr/bin/docker"
-    # Base class attributes needed by unified execute()
+    # Base class attributes needed by unified execute(). Multiplexed Docker
+    # deliberately starts with safe-state persistence disabled.
     env._session_id = "test123"
-    env._snapshot_path = "/tmp/hermes-snap-test123.sh"
+    env._safe_state_path = "/tmp/hermes-safe-state-test123.v1"
+    env._safe_state_marker = "__HERMES_SAFE_STATE_test123__"
+    env._safe_state_ready = False
+    env._safe_state_disabled_reason = "multiplex_mode"
+    env._safe_state_warning_emitted = True
+    env._safe_state_platform = "posix"
     env._cwd_file = "/tmp/hermes-cwd-test123.txt"
     env._cwd_marker = "__HERMES_CWD_test123__"
-    env._snapshot_ready = True
+    env._prefer_nonlogin = False
     env._last_sync_time = None
-    env._init_env_args = []
     return env
 
 
@@ -183,7 +188,7 @@ def test_init_env_args_uses_hermes_dotenv_for_allowlisted_env(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"DATABASE_URL": "value_from_dotenv"})
 
-    args = env._build_init_env_args()
+    args, _unsets = env._build_init_env_args()
     args_str = " ".join(args)
 
     assert "DATABASE_URL=value_from_dotenv" in args_str
@@ -196,7 +201,7 @@ def test_init_env_args_prefers_shell_env_over_hermes_dotenv(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "value_from_shell")
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"DATABASE_URL": "value_from_dotenv"})
 
-    args = env._build_init_env_args()
+    args, _unsets = env._build_init_env_args()
     args_str = " ".join(args)
 
     assert "DATABASE_URL=value_from_shell" in args_str
@@ -215,7 +220,7 @@ def test_init_env_args_uses_hermes_dotenv_for_empty_shell_env(monkeypatch):
     monkeypatch.setenv("MY_SECRET", "")
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"MY_SECRET": "value_from_dotenv"})
 
-    args = env._build_init_env_args()
+    args, _unsets = env._build_init_env_args()
 
     # Assert on the resolved value, not the printed -e flag: the disk value
     # must win and a blank "MY_SECRET=" flag must never be emitted.
@@ -233,7 +238,7 @@ def test_init_env_args_uses_active_profile_for_forwarded_env(monkeypatch):
     ss.set_multiplex_active(True)
     token = ss.set_secret_scope({"SERVICE_TOKEN": "token-for-routed-profile"})
     try:
-        args = env._build_init_env_args()
+        args, _unsets = env._build_init_env_args()
     finally:
         ss.reset_secret_scope(token)
         ss.set_multiplex_active(False)
@@ -252,7 +257,7 @@ def test_init_env_args_omits_missing_scoped_forwarded_env(monkeypatch):
     ss.set_multiplex_active(True)
     token = ss.set_secret_scope({})
     try:
-        args = env._build_init_env_args()
+        args, _unsets = env._build_init_env_args()
     finally:
         ss.reset_secret_scope(token)
         ss.set_multiplex_active(False)
@@ -296,18 +301,14 @@ def test_runtime_exec_tracks_scope_and_clears_missing_value(monkeypatch):
 
 
 def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, tmp_path):
-    """The shared snapshot must not resurrect an explicit forward-only value."""
+    """Multiplexed Docker resolves every login invocation from its own scope."""
     from agent import secret_scope as ss
+    from tools.environments.local import _find_bash
 
     env = _make_execute_only_env(forward_env=["EXPLICIT_TOKEN"])
-    env.cwd = str(tmp_path)
-    env._snapshot_path = str(tmp_path / "snapshot.sh")
+    env.cwd = "/"
+    env._safe_state_path = str(tmp_path / "safe-state.v1")
     env._cwd_file = str(tmp_path / "cwd.txt")
-    env._snapshot_passthrough_names = set()
-    (tmp_path / "snapshot.sh").write_text(
-        "export EXPLICIT_TOKEN=stale-from-previous-profile\n",
-        encoding="utf-8",
-    )
     monkeypatch.setenv("EXPLICIT_TOKEN", "token-for-default")
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
 
@@ -321,9 +322,11 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
             key, value = cmd[index + 1].split("=", 1)
             child_env[key] = value
             index += 2
-        assert cmd[container_index + 1 : container_index + 3] == ["bash", "-c"]
+        assert cmd[container_index + 1 : container_index + 4] == [
+            "bash", "-l", "-c",
+        ]
         return subprocess.Popen(
-            ["bash", "-c", cmd[container_index + 3]],
+            [_find_bash(), "-c", cmd[container_index + 4]],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
@@ -350,11 +353,148 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
 
             assert result["returncode"] == 0
             assert result["output"] == expected
-            assert "EXPLICIT_TOKEN=" not in (
-                tmp_path / "snapshot.sh"
-            ).read_text(encoding="utf-8")
+            assert not (tmp_path / "safe-state.v1").exists()
     finally:
         ss.set_multiplex_active(False)
+
+
+def test_multiplexed_docker_init_never_starts_safe_state(tmp_path):
+    from agent import secret_scope as ss
+
+    env = _make_execute_only_env()
+    env._safe_state_path = str(tmp_path / "safe-state.v1")
+    env._safe_state_disabled_reason = None
+    calls = []
+    env._run_bash = lambda *args, **kwargs: calls.append((args, kwargs))
+
+    ss.set_multiplex_active(True)
+    try:
+        env.init_session()
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert calls == []
+    assert env._safe_state_ready is False
+    assert env._safe_state_disabled_reason == "multiplex_mode"
+    assert not (tmp_path / "safe-state.v1").exists()
+
+
+def test_login_builder_returns_args_and_unsets_together(monkeypatch):
+    from agent import secret_scope as ss
+
+    env = _make_execute_only_env(forward_env=["SERVICE_TOKEN"])
+    monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        args, unsets = env._build_init_env_args()
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+    assert "SERVICE_TOKEN=token-for-default" not in args
+    assert unsets == ("SERVICE_TOKEN",)
+
+
+def test_passthrough_import_failure_unsets_multiplex_secret(monkeypatch):
+    import builtins
+    from agent import secret_scope as ss
+
+    env = _make_execute_only_env(forward_env=["EXPLICIT_TOKEN"])
+    monkeypatch.setenv("EXPLICIT_TOKEN", "token-for-default")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+    real_import = builtins.__import__
+
+    def fail_passthrough_import(name, *args, **kwargs):
+        if name == "tools.env_passthrough":
+            raise ImportError("synthetic passthrough import failure")
+        return real_import(name, *args, **kwargs)
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({"EXPLICIT_TOKEN": "token-for-profile-b"})
+    try:
+        monkeypatch.setattr(builtins, "__import__", fail_passthrough_import)
+        values, unsets = env._resolve_passthrough_env()
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+    assert "EXPLICIT_TOKEN" not in values
+    assert "EXPLICIT_TOKEN" in unsets
+
+
+def test_concurrent_login_invocations_keep_unsets_local(monkeypatch):
+    import threading
+    from agent import secret_scope as ss
+
+    env = _make_execute_only_env(forward_env=["EXPLICIT_TOKEN"])
+    env._env = {"EXPLICIT_TOKEN": "static-profile-a"}
+    monkeypatch.setenv("EXPLICIT_TOKEN", "token-for-default")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    missing_built = threading.Event()
+    present_built = threading.Event()
+    original_build = env._build_init_env_args
+
+    def coordinated_build():
+        result = original_build()
+        if threading.current_thread().name == "missing-scope":
+            missing_built.set()
+            assert present_built.wait(5)
+        else:
+            assert missing_built.wait(5)
+            present_built.set()
+        return result
+
+    commands = {}
+    errors = []
+    env._build_init_env_args = coordinated_build
+    monkeypatch.setattr(
+        docker_env,
+        "_popen_bash",
+        lambda cmd, stdin_data=None: commands.__setitem__(
+            threading.current_thread().name, cmd
+        ) or object(),
+    )
+
+    def run_scoped(scope):
+        token = ss.set_secret_scope(scope)
+        try:
+            env._run_bash(
+                "printf '%s' \"${EXPLICIT_TOKEN-unset}\"",
+                login=True,
+            )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            ss.reset_secret_scope(token)
+
+    ss.set_multiplex_active(True)
+    missing = threading.Thread(name="missing-scope", target=run_scoped, args=({},))
+    present = threading.Thread(
+        name="present-scope",
+        target=run_scoped,
+        args=({"EXPLICIT_TOKEN": "token-for-profile-b"},),
+    )
+    try:
+        missing.start()
+        present.start()
+        missing.join(10)
+        present.join(10)
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert not missing.is_alive() and not present.is_alive()
+    assert errors == []
+    missing_cmd = commands["missing-scope"]
+    present_cmd = commands["present-scope"]
+    assert not any(arg.startswith("EXPLICIT_TOKEN=") for arg in missing_cmd)
+    assert "unset EXPLICIT_TOKEN" in missing_cmd[-1]
+    assert "EXPLICIT_TOKEN=token-for-profile-b" in present_cmd
+    assert "EXPLICIT_TOKEN=static-profile-a" not in present_cmd
+    assert "EXPLICIT_TOKEN=token-for-default" not in present_cmd
+    assert "unset EXPLICIT_TOKEN" not in present_cmd[-1]
 
 
 # ── docker_env tests ──────────────────────────────────────────────
@@ -413,7 +553,7 @@ def test_forward_env_overrides_docker_env_in_init_args(monkeypatch):
     monkeypatch.setenv("MY_KEY", "dynamic_value")
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
 
-    args = env._build_init_env_args()
+    args, _unsets = env._build_init_env_args()
     args_str = " ".join(args)
 
     assert "MY_KEY=dynamic_value" in args_str

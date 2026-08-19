@@ -861,12 +861,6 @@ class DockerEnvironment(BaseEnvironment):
     across container restarts.
     """
 
-    _profile_scoped_passthrough = True
-
-    def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
-        """Keep explicit docker_forward_env values out of shared snapshots."""
-        return tuple(self._forward_env)
-
     def __init__(
         self,
         image: str,
@@ -900,7 +894,6 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
-        self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
@@ -1517,29 +1510,22 @@ class DockerEnvironment(BaseEnvironment):
             self._container_id = result.stdout.strip()
             logger.info("Started container %s (%s)", container_name, self._container_id[:12])
 
-        # Build the init-time env forwarding args used to seed the snapshot.
-        self._init_env_args = self._build_init_env_args()
-
-        # Initialize session snapshot inside the container
+        # Initialize default-deny safe state inside the container. Multiplex
+        # mode is detected by BaseEnvironment and leaves persistence off.
         self.init_session()
 
-    def _build_init_env_args(self) -> list[str]:
-        """Build -e KEY=VALUE args for injecting host env vars into init_session.
-
-        These are used during init_session() so that export -p captures the
-        configured environment and the current profile's forwarded values.
-        """
+    def _build_init_env_args(self) -> tuple[list[str], tuple[str, ...]]:
+        """Build login env args and unsets from the active profile."""
         passthrough_env, unset_names = self._resolve_passthrough_env()
         exec_env: dict[str, str] = dict(self._env)
         exec_env.update(passthrough_env)
         for name in unset_names:
             exec_env.pop(name, None)
-        self._init_unset_passthrough_names = tuple(sorted(unset_names))
 
         args = []
         for key in sorted(exec_env):
             args.extend(["-e", f"{key}={exec_env[key]}"])
-        return args
+        return args, tuple(sorted(unset_names))
 
     def _build_passthrough_env(self) -> dict[str, str]:
         """Resolve forwarded host variables through the active profile scope."""
@@ -1551,19 +1537,40 @@ class DockerEnvironment(BaseEnvironment):
         explicit_forward_keys = set(self._forward_env)
         passthrough_keys: set[str] = set()
         resolve_passthrough_value = None
-        multiplex_active = False
+        multiplex_active = True
         is_global_env = lambda _name: False  # noqa: E731
+        try:
+            from agent.secret_scope import (
+                _is_global_env,
+                is_multiplex_active as _is_multiplex_active,
+            )
+
+            is_global_env = _is_global_env
+            multiplex_active = _is_multiplex_active()
+        except Exception:
+            logger.warning(
+                "Could not resolve Docker secret-scope state; forwarding fails closed",
+                exc_info=True,
+            )
         try:
             from tools.env_passthrough import (
                 get_all_passthrough,
-                resolve_passthrough_value,
+                resolve_passthrough_value as _resolve_passthrough_value,
             )
-            from agent.secret_scope import _is_global_env, is_multiplex_active as _is_multiplex_active
-            is_global_env = _is_global_env
-            multiplex_active = _is_multiplex_active()
-            passthrough_keys = set(get_all_passthrough())
+
+            resolve_passthrough_value = _resolve_passthrough_value
+            try:
+                passthrough_keys = set(get_all_passthrough())
+            except Exception:
+                logger.warning(
+                    "Could not resolve Docker passthrough registry; implicit forwarding disabled",
+                    exc_info=True,
+                )
         except Exception:
-            pass
+            logger.warning(
+                "Could not import Docker passthrough resolver; scoped forwarding fails closed",
+                exc_info=True,
+            )
         # Explicit docker_forward_env entries are an intentional opt-in and must
         # win over the generic Hermes secret blocklist. Only implicit passthrough
         # keys are filtered. Also strip Hermes-internal dynamic secrets
@@ -1576,12 +1583,23 @@ class DockerEnvironment(BaseEnvironment):
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         unset_names: set[str] = set()
         for key in sorted(forward_keys):
-            value = os.getenv(key) or hermes_env.get(key)
-            if resolve_passthrough_value is not None:
-                value = resolve_passthrough_value(key, value)
+            fallback_value = os.getenv(key) or hermes_env.get(key)
+            scoped_key = multiplex_active and not is_global_env(key)
+            if resolve_passthrough_value is None:
+                value = None if scoped_key else fallback_value
+            else:
+                try:
+                    value = resolve_passthrough_value(key, fallback_value)
+                except Exception:
+                    logger.warning(
+                        "Could not resolve Docker passthrough value for %s; forwarding fails closed",
+                        key,
+                        exc_info=True,
+                    )
+                    value = None if scoped_key else fallback_value
             if value is not None:
                 exec_env[key] = value
-            elif multiplex_active and not is_global_env(key) and _ENV_VAR_NAME_RE.fullmatch(key):
+            elif scoped_key and _ENV_VAR_NAME_RE.fullmatch(key):
                 unset_names.add(key)
         return exec_env, unset_names
 
@@ -1606,18 +1624,14 @@ class DockerEnvironment(BaseEnvironment):
         if stdin_data is not None:
             cmd.append("-i")
 
-        # Init seeds the snapshot. Profile-scoped passthrough values are also
-        # injected on every later command because this container can be shared
-        # by multiple routed profiles in one gateway process.
-        unset_names: tuple[str, ...] = ()
+        # Login and runtime invocations resolve the active profile independently.
+        # No scoped values or unset decisions are cached on this shared object.
         if login:
-            cmd.extend(self._init_env_args)
-        elif self._profile_scoped_passthrough:
-            runtime_args, unset_names = self._build_runtime_env_args_with_unsets()
-            cmd.extend(runtime_args)
+            invocation_args, unset_names = self._build_init_env_args()
+        else:
+            invocation_args, unset_names = self._build_runtime_env_args_with_unsets()
+        cmd.extend(invocation_args)
 
-        if login:
-            unset_names = getattr(self, "_init_unset_passthrough_names", ())
         if unset_names:
             quoted_names = " ".join(shlex.quote(name) for name in unset_names)
             cmd_string = f"unset {quoted_names} 2>/dev/null || true\n{cmd_string}"
@@ -1718,9 +1732,10 @@ class DockerEnvironment(BaseEnvironment):
                 logger.error("Recovery: failed to create new container: %s", e)
                 return False
 
-        # 3. Re-initialize session snapshot in the (re)created container.
+        # 3. Re-initialize safe state in the (re)created container.
         try:
-            self._snapshot_ready = False
+            self._safe_state_ready = False
+            self._safe_state_disabled_reason = None
             self.init_session()
         except Exception as e:
             logger.error("Recovery: init_session failed in new container: %s", e)
