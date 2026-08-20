@@ -6,6 +6,7 @@ from tools.environments.safe_terminal_state import (
     SAFE_STATE_HEADER,
     SAFE_STATE_MAX_FILE_BYTES,
     SAFE_STATE_NAMES,
+    SAFE_STATE_PASSTHROUGH_ENV,
     SafeStateError,
     decode_safe_state,
     encode_safe_state,
@@ -32,6 +33,10 @@ def test_allowlist_is_exact_and_ordered():
     assert SAFE_STATE_MAX_FILE_BYTES == 65_536
 
 
+def test_passthrough_marker_is_fixed_and_contains_no_value():
+    assert SAFE_STATE_PASSTHROUGH_ENV == "HERMES_SAFE_STATE_PASSTHROUGH_ACTIVE"
+
+
 def test_round_trip_emits_one_record_per_name():
     payload = encode_safe_state(
         {
@@ -47,6 +52,8 @@ def test_round_trip_emits_one_record_per_name():
     assert records["PATH"] == "/opt/app/.venv/bin:/usr/bin"
     assert records["VIRTUAL_ENV"] == "/opt/app/.venv"
     assert records["CONDA_PREFIX"] is None
+    assert state.records[0][0] == "PATH"
+    assert state.records[0] == ("PATH", "/opt/app/.venv/bin:/usr/bin")
     assert payload.count(b"\n") == len(EXPECTED_NAMES) + 1
     assert payload.endswith(b"\n")
 
@@ -110,6 +117,17 @@ def test_msys_and_native_windows_paths_are_accepted():
     assert validate_safe_value(
         "VIRTUAL_ENV", r"C:\Project\.venv", platform="msys"
     ) == r"C:\Project\.venv"
+    mixed = r"C:\Project\.venv/Scripts:/usr/bin:/bin"
+    assert validate_safe_value("PATH", mixed, platform="msys") == mixed
+
+
+def test_msys_drive_prefixed_colon_list_rejects_relative_tail():
+    with pytest.raises(SafeStateError, match="path_not_absolute"):
+        validate_safe_value("PATH", "C:/safe:relative", platform="msys")
+    with pytest.raises(SafeStateError, match="path_not_absolute"):
+        validate_safe_value("PATH", "É:/usr/bin:/bin", platform="msys")
+    with pytest.raises(SafeStateError, match="path_mixed_separator"):
+        validate_safe_value("PATH", "/usr/bin:relative;/bin", platform="msys")
 
 
 @pytest.mark.parametrize("value", ["-1", "100", "not-a-number", "1.0", ""])

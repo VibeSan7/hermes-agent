@@ -80,6 +80,36 @@ class TestWrapCommand:
         assert "_hss_apply" not in wrapped
         assert "_hss_capture" not in wrapped
 
+    def test_runtime_target_preflight_failure_skips_state_apply(self):
+        env = _TestableEnv()
+        env._safe_state_ready = True
+        env._prepare_safe_state_target = lambda: (False, "acl")
+        env._prepare_safe_state_artifact = lambda: (True, "")
+
+        wrapped = env._wrap_command("echo hello", "/tmp")
+
+        assert env._safe_state_ready is False
+        assert env._safe_state_disabled_reason == "acl"
+        assert env._safe_state_path not in wrapped
+        assert "_hss_apply" not in wrapped
+
+    def test_runtime_target_hook_exception_fails_closed(self):
+        env = _TestableEnv()
+        env._safe_state_ready = True
+
+        def fail_target_check():
+            raise RuntimeError("synthetic target hook failure")
+
+        env._prepare_safe_state_target = fail_target_check
+
+        wrapped = env._wrap_command("echo hello", "/tmp")
+
+        assert env._safe_state_ready is False
+        assert env._safe_state_disabled_reason == "target_check_failed"
+        assert env._safe_state_path not in wrapped
+        assert "_hss_apply" not in wrapped
+        assert "eval 'echo hello'" in wrapped
+
     def test_single_quote_escaping(self):
         env = _TestableEnv()
         env._safe_state_ready = True
@@ -96,7 +126,7 @@ class TestWrapCommand:
 
 
 class TestAtomicSafeStateWrite:
-    def test_wrap_command_uses_atomic_temp_then_mv(self):
+    def test_wrap_command_uses_trusted_atomic_replace(self):
         env = _TestableEnv()
         env._safe_state_ready = True
 
@@ -104,23 +134,25 @@ class TestAtomicSafeStateWrite:
 
         assert "export -p" not in wrapped
         assert "source " not in wrapped
-        assert "mktemp " in wrapped
-        assert ".tmp.XXXXXXXXXX" in wrapped
-        assert "mv -f " in wrapped
+        assert "tempfile.mkstemp" in wrapped
+        assert "os.fdopen" in wrapped
+        assert "os.getpid()" not in wrapped
+        assert "mktemp " not in wrapped
+        assert "mv -f " not in wrapped
         assert env._safe_state_path in wrapped
 
-    def test_temp_path_uses_mktemp_not_pid_variables(self):
+    def test_temp_path_never_uses_shell_pid_variables(self):
         env = _TestableEnv()
         env._safe_state_ready = True
 
         wrapped = env._wrap_command("echo hi", "/tmp")
 
-        assert "mktemp " in wrapped
-        assert ".tmp.XXXXXXXXXX" in wrapped
+        assert "tempfile.mkstemp" in wrapped
+        assert "os.getpid()" not in wrapped
         assert "$BASHPID" not in wrapped
         assert ".tmp.$$" not in wrapped
 
-    def test_init_session_bootstrap_also_atomic_and_mktemp(self):
+    def test_init_session_bootstrap_uses_trusted_atomic_replace(self):
         env = _TestableEnv()
         captured = {}
 
@@ -132,9 +164,11 @@ class TestAtomicSafeStateWrite:
         env.init_session()
 
         boot = captured.get("cmd", "")
-        assert ".tmp.XXXXXXXXXX" in boot
-        assert "mktemp " in boot
-        assert "mv -f " in boot
+        assert "tempfile.mkstemp" in boot
+        assert "os.fdopen" in boot
+        assert "os.getpid()" not in boot
+        assert "mktemp " not in boot
+        assert "mv -f " not in boot
         assert "$BASHPID" not in boot
         assert ".tmp.$$" not in boot
         assert "export -p" not in boot
@@ -201,8 +235,7 @@ class TestEmbedStdinHeredoc:
     def test_inline_stdin_uses_anonymous_process_substitution(self):
         result = BaseEnvironment._embed_stdin_inline("cat", "hello\nworld")
 
-        assert result.startswith("{ cat; } < <(printf '%s' ")
-        assert "hello\nworld" in result
+        assert result == "{\ncat\n} < <(printf '%s' 'hello\nworld')"
         assert "HERMES_STDIN_" not in result
 
     def test_inline_stdin_rejects_nul(self):
@@ -349,16 +382,39 @@ class TestSafeTerminalStateContract:
         caplog.set_level(logging.WARNING)
         marker = env._safe_state_marker
         result = {
-            "output": f"before\n{marker}apply_invalid{marker}\nafter\n",
+            "output": f"before\n{marker}apply_93{marker}\nafter\n",
         }
 
         env._extract_safe_state_status(result)
 
         assert env._safe_state_ready is False
-        assert env._safe_state_disabled_reason == "apply_invalid"
+        assert env._safe_state_disabled_reason == "apply_93"
         assert marker not in result["output"]
         assert "before" in result["output"]
         assert "after" in result["output"]
+
+    def test_post_execute_artifact_hook_exception_fails_closed(self):
+        env = _TestableEnv()
+        env._safe_state_ready = True
+        env._prepare_safe_state_target = lambda: (True, "")
+        env._run_bash = lambda *args, **kwargs: object()
+        env._wait_for_process = lambda *args, **kwargs: {
+            "output": "command-ok",
+            "returncode": 0,
+            "cwd_observed": True,
+        }
+
+        def fail_artifact_check():
+            raise RuntimeError("synthetic artifact hook failure")
+
+        env._prepare_safe_state_artifact = fail_artifact_check
+
+        result = env.execute("true")
+
+        assert result["returncode"] == 0
+        assert result["output"] == "command-ok"
+        assert env._safe_state_ready is False
+        assert env._safe_state_disabled_reason == "artifact_check_failed"
 
     def test_legacy_snapshot_file_is_never_referenced(self):
         env = _TestableEnv()

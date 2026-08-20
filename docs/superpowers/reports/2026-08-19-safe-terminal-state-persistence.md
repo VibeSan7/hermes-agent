@@ -1,7 +1,7 @@
 # Safe Terminal State Persistence — Implementation Report
 
 Date: 2026-08-19
-Status: **review-ready code; not deployed**
+Status: **review-ready after owner-approved fail-closed amendment; not deployed**
 
 ## 1. Review scope
 
@@ -45,16 +45,18 @@ The state file is versioned data, not a shell script. It is never sourced or eva
 
 Backend behavior:
 
-| Backend | Single-profile v1 state | Multiplex state | Credential handling |
+| Backend | Credential-free single-profile v1 state | Passthrough / multiplex state | Credential handling |
 |---|---|---|---|
-| Local | Enabled after private-path, identity, ACL/mode, codec checks | Off | Fresh subprocess environment per invocation |
-| Docker | Enabled inside the private container lifecycle | Off | Profile values and unsets resolved per invocation |
+| Local | Enabled after private-path, identity, ACL/mode, codec checks | Permanently off for the environment object before apply/capture | Fresh subprocess environment per invocation |
+| Docker | Off | Off | Profile values/unsets remain invocation-local; command and filesystem persistence are separate |
 | SSH | Off | Off | Existing invocation path; no terminal env persistence |
 | Singularity | Off | Off | Existing invocation path; no terminal env persistence |
-| Modal | Off | Off | Existing invocation path; no terminal env persistence |
+| Modal (direct and managed) | Off | Off | Existing transport/filesystem lifecycle; no Hermes terminal env persistence |
 | Daytona | Off | Off | Existing invocation path; no terminal env persistence |
 | Vercel Sandbox | Off | Off | Existing invocation path; no terminal env persistence |
 | New/unclassified Base backend | Off by default | Off | Must explicitly prove the v1 contract before opt-in |
+
+The owner-approved 2026-08-20 amendment removes transformed-credential detection entirely. A fixed value-free marker (`HERMES_SAFE_STATE_PASSTHROUGH_ACTIVE=1`) makes probe return `98`, so any invocation that actually receives a passthrough value runs without applying or capturing terminal environment state. Any nonzero user-command result likewise preserves its result and permanently disables persistence for that environment object.
 
 Filesystem/container snapshots used by Modal, Singularity, Daytona, and Vercel are separate product features. They do not authorize terminal environment serialization.
 
@@ -67,6 +69,7 @@ Filesystem/container snapshots used by Modal, Singularity, Daytona, and Vercel a
 | Unknown/arbitrary names rejected | `tests/tools/test_safe_terminal_state.py::test_unknown_name_is_rejected` |
 | Control characters, invalid UTF-8, noncanonical Base64, invalid values rejected | `tests/tools/test_safe_terminal_state.py::test_control_characters_are_rejected`, `::test_invalid_utf8_is_rejected`, `::test_noncanonical_base64_is_rejected`, `::test_invalid_decoded_value_rejects_whole_file` |
 | PATH and marker size/range/path validation | `tests/tools/test_safe_terminal_state.py::test_path_and_other_value_size_limits`, `::test_conda_shlvl_rejects_invalid_values`, `::test_posix_path_list_rejects_uri_relative_and_empty_entries`, `::test_msys_and_native_windows_paths_are_accepted` |
+| Python/runtime MSYS parser parity rejects non-ASCII drive letters | `tests/tools/test_safe_terminal_state.py::test_msys_drive_prefixed_colon_list_rejects_relative_tail`, `tests/tools/test_safe_terminal_state_shell.py::test_runtime_parser_rejects_drive_prefixed_colon_path_list` |
 | No full environment dump | `tests/tools/test_safe_terminal_state_shell.py::test_generated_scripts_never_execute_or_dump_environment`, `tests/tools/test_base_environment.py::TestSafeTerminalStateContract::test_init_session_never_builds_full_environment_dump` |
 | State contents treated only as data | `tests/tools/test_safe_terminal_state_shell.py::test_apply_treats_encoded_value_as_data_not_shell_code` |
 | Whole malformed state rejected; no partial apply | `tests/tools/test_safe_terminal_state_shell.py::test_malformed_extra_line_rejects_whole_file_without_partial_apply`, `tests/tools/test_safe_terminal_state.py::test_malformed_payload_rejects_whole_file` |
@@ -77,10 +80,20 @@ Filesystem/container snapshots used by Modal, Singularity, Daytona, and Vercel a
 | Venv deactivation clears stale state and PATH | `tests/tools/test_safe_terminal_state_integration.py::test_deactivate_clears_stale_venv_and_path`, `tests/tools/test_safe_terminal_state_shell.py::test_second_capture_emits_unset_and_clears_stale_venv` |
 | Conda markers persist and deactivate | `tests/tools/test_safe_terminal_state_integration.py::test_conda_markers_persist_and_deactivate` |
 | Multiplex mode writes/applies no state | `tests/tools/test_base_environment.py::TestSafeTerminalStateContract::test_multiplex_mode_disables_state_before_bootstrap`, `tests/tools/test_docker_environment.py::test_multiplexed_docker_init_never_starts_safe_state` |
+| Credential-bearing invocation disables state host-side before shell startup/apply/capture | `tests/tools/test_safe_terminal_state_integration.py::test_forwarded_passthrough_disables_safe_state_permanently`, `::test_shell_startup_cannot_bypass_host_passthrough_shutdown`, `::test_passthrough_marker_contains_no_credential_and_cannot_persist` |
+| Unforwarded scope values set no persistence-off marker | `tests/tools/test_safe_terminal_state_integration.py::test_unforwarded_scoped_value_does_not_set_passthrough_marker` |
+| Nonzero user command preserves result and disables state | `tests/tools/test_safe_terminal_state_integration.py::test_user_failure_exit_code_survives_state_capture`, `::test_set_e_user_failure_disables_unobserved_stale_state`, `::test_failed_command_cannot_keep_state_ready_with_fake_cwd_marker` |
+| Successful early exit must produce a new Local state-file revision | `tests/tools/test_safe_terminal_state_integration.py::test_zero_exit_fake_cwd_marker_cannot_hide_missing_capture` |
+| Startup hooks disable state host-side and inherited `set -e` cannot suppress the command | `tests/tools/test_safe_terminal_state_integration.py::test_shell_startup_env_disables_persistence_host_side`, `::test_shell_startup_inputs_disable_persistence`, `::test_inherited_errexit_startup_disables_before_apply_and_runs_command` |
+| Host preflight and Bash spawn consume one exact invocation-local env; failure clears stale env | `tests/tools/test_safe_terminal_state_integration.py::test_preflight_and_popen_use_same_run_env`, `::test_preflight_failure_clears_stale_prepared_run_env` |
+| Inline stdin safely frames trailing comments | `tests/tools/test_safe_terminal_state_integration.py::test_local_inline_stdin_accepts_trailing_comment` |
+| Capture flattens exported strings and is independent of post-command `declare`/`builtin`/`printf` | `tests/tools/test_safe_terminal_state_shell.py::test_capture_flattens_exported_values_and_ignores_printf_shadow`, `::test_capture_uses_exported_value_when_declare_is_disabled`, `::test_capture_ignores_builtin_function_shadow`, `::test_capture_uses_exported_value_when_builtin_is_disabled` |
+| Docker missing-handle recovery is controlled and cannot re-enable permanent-off state | `tests/tools/test_docker_environment.py::test_execute_recreates_missing_container_before_base_execute`, `::test_recovery_cannot_reenable_permanently_disabled_state` |
+| Docker long wrappers use stdin transport | `tests/tools/test_docker_environment.py::test_docker_run_bash_transports_long_script_over_stdin` |
 | Profile credentials remain invocation-local | `tests/tools/test_docker_environment.py::test_wrapped_exec_scopes_explicit_forward_env_across_profiles`, `::test_runtime_exec_tracks_scope_and_clears_missing_value`, `tests/tools/test_env_passthrough.py::TestProfileScopedResolution` |
 | Docker concurrent login decisions do not race through shared fields | `tests/tools/test_docker_environment.py::test_concurrent_login_invocations_keep_unsets_local` |
 | Resolver/import failure fails closed | `tests/tools/test_docker_environment.py::test_passthrough_import_failure_unsets_multiplex_secret`, `tests/tools/test_env_passthrough.py::TestTerminalIntegration::test_provider_blocklist_import_failure_fails_closed` |
-| Docker single-profile safe state works | `tests/tools/test_docker_environment.py::test_single_profile_docker_uses_safe_state` |
+| Docker and managed Modal safe state are explicitly unsupported | `tests/tools/test_docker_environment.py::test_single_profile_docker_safe_state_is_unsupported`, `tests/tools/test_managed_modal_environment.py::test_managed_modal_explicitly_disables_safe_state` |
 | Unsupported and unclassified backends remain off but commands run | `tests/tools/test_safe_terminal_state_backends.py::test_unclassified_backend_defaults_to_persistence_off`, `::test_unsupported_backend_disables_state_and_still_executes` |
 | Codec failure creates no state | `tests/tools/test_safe_terminal_state_shell.py::test_codec_probe_failure_creates_no_state_file` |
 | Malformed state disables persistence but user command continues | `tests/tools/test_safe_terminal_state_integration.py::test_malformed_state_fails_closed_but_command_still_runs` |
@@ -112,52 +125,31 @@ The implementation followed TDD checkpoints. Representative failures before prod
 
 ## 6. Fresh verification evidence
 
-### Relevant Python suite
+### Canonical security/backend suite
 
 ```text
-290 passed, 11 skipped in 81.74s
+scripts/run_tests.sh -j 4 <13 focused test files> -q
+272 passed, 0 failed, 6 skipped
 ```
 
-Skip reasons:
+The six skips are explicit platform lanes (`linux_only`/POSIX contracts) on the native Windows host. Windows ACL, owner, reparse/junction, MSYS transport, and explicit-empty stdin tests ran on their real host.
 
-- 1 POSIX mode contract test: valid only on POSIX.
-- 4 Linux-only MSYS/path tests: host is Windows.
-- 1 POSIX Local cross-session integration lane.
-- 5 real SSH integration tests: `TERMINAL_SSH_HOST` / `TERMINAL_SSH_USER` not configured.
+A separate 12-file Local baseline sweep produced `148 passed, 11 failed, 8 skipped`. The failures are outside the changed code: three stale full-snapshot expectations that contradict the new default-deny contract, three Windows `HOME`/native-path portability assumptions, two POSIX process-group tests on Windows, one existing background-child pipe-hang case, and two cwd/platform expectations. They are reported rather than counted as green or silently waived.
 
-The Windows reparse test did not skip: when symlink privilege was unavailable it created a real temporary junction and verified rejection.
+### Docker/Modal off-contract and command evidence
 
-### Canonical full-project runner limitation
-
-The canonical per-file runner was attempted as:
-
-```text
-python scripts/run_tests_parallel.py --slice 1/8 -j 4 -q
-```
-
-Slice 1/8 exceeded the available 300-second foreground tool budget and the
-harness terminated it. A process scan immediately afterward found no surviving
-runner or pytest descendants. This attempt is neither pass nor failure evidence;
-the review must rely on the complete 290-test security/backend scope above and
-CI for the full project matrix.
-
-### Repeated race/runtime checks
-
-```text
-Local venv persistence:                 10/10
-Local venv deactivation:                10/10
-Malformed config independence:          10/10
-Docker concurrent login scope:          10/10
-Docker profile A -> B -> missing scope: 10/10
-```
+- Docker and managed Modal explicitly advertise `_safe_state_persistence_supported = False`; their tests prove no bootstrap/state file is attempted.
+- A 40,067-character Docker command transported through stdin returned the exact user payload with exit code 0; command execution remains available without terminal env persistence.
+- Docker recovery keeps a previously disabled reason and cannot re-enable persistence on the same environment object.
+- Local safe-state Bash snippets parsed byte-exactly under host Git Bash and real Docker Bash 3.2.
 
 ### Static/security gates
 
-- Ruff: passed on changed Python files.
-- Python compileall: passed on changed Python files.
+- Ruff: passed on every changed Python file.
+- Python `py_compile`: passed on every changed Python file.
 - `git diff --check`: passed.
-- Gitleaks: zero findings in changed/staged diffs. A pre-existing `discord-client-id` example at `security.md:353` exists identically in the base file and is outside this diff.
-- Product search: zero `export -p` / `declare -x` persistence paths; no `_snapshot_path`, `_snapshot_ready`, or legacy state reads. The only `hermes-snap-*` product reference is delete-only stale cleanup.
+- Gitleaks raw live diff scan: zero findings.
+- Product search: zero `export -p` / `declare -x` persistence paths; no `_snapshot_path`, `_snapshot_ready`, hash/Base64 credential metadata, or legacy state reads. The only `hermes-snap-*` product reference is delete-only stale cleanup.
 
 ### Documentation
 
@@ -167,22 +159,16 @@ npm run build:fast: passed
 
 Docusaurus reported two pre-existing broken links from `/docs/` to `/docs/llms.txt` and `/docs/llms-full.txt`; neither is in the changed pages.
 
-```text
-npm run typecheck: blocked before source checking
-```
-
-TypeScript 6 rejects the existing deprecated `baseUrl` option unless `ignoreDeprecations: "6.0"` is added. This configuration issue predates and is unrelated to the Markdown-only documentation changes.
-
 ## 7. Review focus
 
 The independent reviewer should specifically inspect:
 
 1. Whether any path can serialize a full environment or execute state contents.
-2. Whether Local preflight occurs before replacing a pre-existing canonical target.
-3. Whether Windows ACL, reparse, and hardlink checks fail closed without values in logs.
-4. Whether Docker profile values/unsets are entirely invocation-local under concurrency and import failure.
-5. Whether unsupported backend default-off behavior has any command-execution regression.
-6. Whether any credential-shaped value can reach the state file through PATH or allowlisted marker validation.
+2. Whether Python host-side passthrough preflight disables Local state before any Bash startup file can mutate shell gates.
+3. Whether nonzero commands or zero-exit early termination can leave stale state reusable despite the Local artifact-revision check.
+4. Whether Local ACL/owner/reparse/hardlink checks and capture transport failures fail closed without values in logs.
+5. Whether Docker profile values/unsets, recovery, long wrapper/user stdin, and filesystem persistence remain functional while env persistence stays unsupported.
+6. Whether Docker, direct/managed Modal, and every unsupported backend can enter the safe-state bootstrap/apply/capture path.
 
 Any Critical or Important finding blocks deployment.
 

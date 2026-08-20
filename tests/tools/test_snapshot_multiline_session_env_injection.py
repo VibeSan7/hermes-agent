@@ -30,6 +30,25 @@ def _shell_path(path: Path) -> str:
     return _windows_to_msys_path(value) if PLATFORM == "msys" else value
 
 
+def _run_script(script: str, *, cwd: Path, env: dict[str, str]):
+    if sys.platform == "win32":
+        return subprocess.run(
+            [BASH, "-s"],
+            cwd=cwd,
+            env=env,
+            input=script,
+            capture_output=True,
+            text=True,
+        )
+    return subprocess.run(
+        [BASH, "-c", script],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _run_capture_and_apply(
     *,
     tmp_path: Path,
@@ -42,16 +61,17 @@ def _run_capture_and_apply(
         state_path,
         state_path + ".tmp.XXXXXXXXXX",
         platform=PLATFORM,
+        python_path=_windows_to_msys_path(sys.executable),
     )
     environment = os.environ.copy()
+    environment.pop("HERMES_SAFE_STATE_FRESH_NAMES", None)
+    environment.pop("HERMES_SAFE_STATE_PASSTHROUGH_ACTIVE", None)
     environment["PATH"] = "/usr/bin:/bin"
     environment[env_name] = env_value
-    captured = subprocess.run(
-        [BASH, "-c", f"{scripts.probe}\n{scripts.capture}"],
+    captured = _run_script(
+        f"{scripts.probe}\n{scripts.capture}",
         cwd=tmp_path,
         env=environment,
-        capture_output=True,
-        text=True,
     )
     assert captured.returncode == 0, captured.stderr
 
@@ -61,12 +81,10 @@ def _run_capture_and_apply(
     assert env_name.encode() not in payload
     assert b"touch " not in payload
 
-    applied = subprocess.run(
-        [BASH, "-c", f"{scripts.probe}\n{scripts.apply}"],
+    applied = _run_script(
+        f"{scripts.probe}\n{scripts.apply}",
         cwd=tmp_path,
         env={"PATH": "/usr/bin:/bin"},
-        capture_output=True,
-        text=True,
     )
     assert applied.returncode == 0, applied.stderr
     assert not marker.exists()

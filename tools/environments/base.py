@@ -603,15 +603,22 @@ class BaseEnvironment(ABC):
         """Return *path* in the target Bash namespace without quoting it."""
         return path
 
+    def _safe_state_python_path(self) -> str | None:
+        """Absolute interpreter for the codec, or None for probe resolution.
+
+        Local uses Hermes' own absolute interpreter so the codec never
+        depends on ``$PATH``.  Container backends return None and the probe
+        resolves an absolute python on the fresh PATH.
+        """
+        return None
+
     def _safe_state_scripts(self) -> SafeStateShellScripts:
         state_path = self._safe_state_shell_path(self._safe_state_path)
-        temp_template = self._safe_state_shell_path(
-            self._safe_state_path + ".tmp.XXXXXXXXXX"
-        )
         return build_safe_state_shell_scripts(
             state_path,
-            temp_template,
+            state_path + ".tmp.XXXXXXXXXX",
             platform=self._safe_state_platform,
+            python_path=self._safe_state_python_path(),
         )
 
     def _prepare_safe_state_artifact(self) -> tuple[bool, str]:
@@ -621,6 +628,14 @@ class BaseEnvironment(ABC):
     def _prepare_safe_state_target(self) -> tuple[bool, str]:
         """Validate a pre-existing canonical target before replacement."""
         return True, ""
+
+    def _safe_state_preflight_off_reason(self) -> str | None:
+        """Return a host-side reason that forbids persistence this invocation."""
+        return None
+
+    def _safe_state_revision(self):
+        """Return a backend artifact revision used to prove capture completed."""
+        return None
 
     def _disable_safe_state(self, reason_code: str) -> None:
         self._safe_state_ready = False
@@ -650,6 +665,14 @@ class BaseEnvironment(ABC):
         if not self._safe_state_persistence_supported:
             self._disable_safe_state("unsupported_backend")
             return
+        try:
+            preflight_reason = self._safe_state_preflight_off_reason()
+        except Exception:
+            self._disable_safe_state("host_preflight_failed")
+            return
+        if preflight_reason is not None:
+            self._disable_safe_state(preflight_reason)
+            return
 
         try:
             valid, reason = self._prepare_safe_state_target()
@@ -672,10 +695,11 @@ class BaseEnvironment(ABC):
                 scripts.probe,
                 "_hss_init_rc=$?",
                 '[ "$_hss_init_rc" -eq 0 ] || exit "$_hss_init_rc"',
+                "if {",
                 scripts.capture,
-                "_hss_init_rc=$?",
-                'if [ "$_hss_init_rc" -ne 0 ]; then',
-                "_hss_capture",
+                "}; then",
+                "_hss_init_rc=0",
+                "else",
                 "_hss_init_rc=$?",
                 "fi",
                 '[ "$_hss_init_rc" -eq 0 ] || exit "$_hss_init_rc"',
@@ -768,9 +792,13 @@ class BaseEnvironment(ABC):
         parts: list[str] = []
         scripts: SafeStateShellScripts | None = None
         if self._safe_state_ready:
-            valid, reason = self._prepare_safe_state_artifact()
-            if not valid:
-                self._disable_safe_state(reason)
+            try:
+                valid, reason = self._prepare_safe_state_target()
+            except Exception:
+                self._disable_safe_state("target_check_failed")
+            else:
+                if not valid:
+                    self._disable_safe_state(reason)
         if self._safe_state_ready:
             try:
                 scripts = self._safe_state_scripts()
@@ -780,16 +808,26 @@ class BaseEnvironment(ABC):
         if scripts is not None and self._safe_state_ready:
             parts.extend(
                 (
+                    "if {",
                     scripts.probe,
+                    "}; then",
+                    "_hss_rc=0",
+                    "else",
                     "_hss_rc=$?",
+                    "fi",
                     "_hss_state_ok=1",
                     'if [ "$_hss_rc" -ne 0 ]; then',
                     f"printf '\\n{self._safe_state_marker}probe_%s"
                     f"{self._safe_state_marker}\\n' \"$_hss_rc\"",
                     "_hss_state_ok=0",
                     "else",
+                    "if {",
                     scripts.apply,
+                    "}; then",
+                    "_hss_rc=0",
+                    "else",
                     "_hss_rc=$?",
+                    "fi",
                     'if [ "$_hss_rc" -ne 0 ]; then',
                     f"printf '\\n{self._safe_state_marker}apply_%s"
                     f"{self._safe_state_marker}\\n' \"$_hss_rc\"",
@@ -811,11 +849,12 @@ class BaseEnvironment(ABC):
         if scripts is not None and self._safe_state_ready:
             parts.extend(
                 (
-                    'if [ "$_hss_state_ok" -eq 1 ]; then',
+                    'if [ "$_hss_state_ok" -eq 1 ] && [ "$__hermes_ec" -eq 0 ]; then',
+                    "if {",
                     scripts.capture,
-                    "_hss_rc=$?",
-                    'if [ "$_hss_rc" -ne 0 ]; then',
-                    "_hss_capture",
+                    "}; then",
+                    "_hss_rc=0",
+                    "else",
                     "_hss_rc=$?",
                     "fi",
                     'if [ "$_hss_rc" -ne 0 ]; then',
@@ -848,7 +887,9 @@ class BaseEnvironment(ABC):
         if "\x00" in stdin_data:
             raise ValueError("NUL is not supported by inline terminal stdin")
         return (
-            f"{{ {command}; }} < <(printf '%s' {shlex.quote(stdin_data)})"
+            "{\n"
+            f"{command}\n"
+            f"}} < <(printf '%s' {shlex.quote(stdin_data)})"
         )
 
     # ------------------------------------------------------------------
@@ -1218,7 +1259,7 @@ class BaseEnvironment(ABC):
         output = result.get("output", "")
         marker = re.escape(self._safe_state_marker)
         pattern = re.compile(
-            rf"\n?{marker}([A-Za-z0-9_]{{1,64}}){marker}\r?\n?"
+            rf"\n?{marker}((?:probe|apply|capture)_[0-9]{{1,3}}){marker}\r?\n?"
         )
         matches = list(pattern.finditer(output))
         if not matches:
@@ -1316,6 +1357,14 @@ class BaseEnvironment(ABC):
         it False: truncating those corrupts data, not just display.
         """
         self._before_execute()
+        try:
+            preflight_reason = self._safe_state_preflight_off_reason()
+        except Exception:
+            if self._safe_state_ready:
+                self._disable_safe_state("host_preflight_failed")
+        else:
+            if self._safe_state_ready and preflight_reason is not None:
+                self._disable_safe_state(preflight_reason)
 
         exec_command, sudo_stdin = self._prepare_command(command)
         # Guard against the `A && B &` subshell-wait trap by default.
@@ -1335,19 +1384,34 @@ class BaseEnvironment(ABC):
         else:
             effective_stdin = stdin_data
 
-        # Embed stdin as heredoc for backends that need it
-        if effective_stdin and self._stdin_mode == "heredoc":
-            exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
+        # Embed stdin for backends that cannot pipe it directly. Empty input is
+        # still explicit input: inline mode must detach the wrapper transport,
+        # while heredoc mode can use the backend's normal EOF stdin.
+        if effective_stdin is not None and self._stdin_mode == "heredoc":
+            if effective_stdin:
+                exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
             effective_stdin = None
-        elif effective_stdin and self._stdin_mode == "inline":
+        elif effective_stdin is not None and self._stdin_mode == "inline":
             exec_command = self._embed_stdin_inline(exec_command, effective_stdin)
             effective_stdin = None
 
+        safe_state_expected = self._safe_state_ready
+        safe_state_revision = None
+        if safe_state_expected:
+            try:
+                safe_state_revision = self._safe_state_revision()
+            except Exception:
+                self._disable_safe_state("revision_check_failed")
+                safe_state_expected = False
         wrapped = self._wrap_command(exec_command, effective_cwd)
 
         # Use a login shell when safe state is unavailable, unless login Bash
         # itself is broken and init_session selected the non-login fallback.
-        login = not self._safe_state_ready and not self._prefer_nonlogin
+        login = (
+            not self._safe_state_ready
+            and not self._prefer_nonlogin
+            and self._safe_state_disabled_reason != "passthrough"
+        )
 
         proc = self._run_bash(
             wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
@@ -1356,11 +1420,40 @@ class BaseEnvironment(ABC):
             proc, timeout=effective_timeout, bounded_capture=bounded_capture
         )
         self._extract_safe_state_status(result)
-        if self._safe_state_ready:
-            valid, reason = self._prepare_safe_state_artifact()
-            if not valid:
-                self._disable_safe_state(reason)
+        if (
+            safe_state_expected
+            and self._safe_state_ready
+            and int(result.get("returncode") or 0) != 0
+        ):
+            self._disable_safe_state("command_failed")
         self._update_cwd(result)
+        if (
+            safe_state_expected
+            and self._safe_state_ready
+            and int(result.get("returncode") or 0) == 0
+            and safe_state_revision is not None
+        ):
+            try:
+                captured_revision = self._safe_state_revision()
+            except Exception:
+                self._disable_safe_state("revision_check_failed")
+            else:
+                if captured_revision is None or captured_revision == safe_state_revision:
+                    self._disable_safe_state("capture_unobserved")
+        if (
+            safe_state_expected
+            and self._safe_state_ready
+            and not result.get("cwd_observed", False)
+        ):
+            self._disable_safe_state("capture_unobserved")
+        if self._safe_state_ready:
+            try:
+                valid, reason = self._prepare_safe_state_artifact()
+            except Exception:
+                self._disable_safe_state("artifact_check_failed")
+            else:
+                if not valid:
+                    self._disable_safe_state(reason)
 
         return result
 

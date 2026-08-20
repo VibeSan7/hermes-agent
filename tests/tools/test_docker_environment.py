@@ -7,6 +7,11 @@ import sys
 import pytest
 
 from tools.environments import docker as docker_env
+from tools.environments.base import BaseEnvironment, _pipe_stdin
+from tools.environments.safe_terminal_state import (
+    SAFE_STATE_FRESH_NAMES_ENV,
+    SAFE_STATE_PASSTHROUGH_ENV,
+)
 
 
 def _mock_subprocess_run(monkeypatch):
@@ -163,6 +168,7 @@ def _make_execute_only_env(forward_env=None):
     env._prepare_command = lambda command: (command, None)
     env._timeout_result = lambda timeout: {"output": f"timed out after {timeout}", "returncode": 124}
     env._container_id = "test-container"
+    env._quarantined_container_id = None
     env._docker_exe = "/usr/bin/docker"
     # Base class attributes needed by unified execute(). Multiplexed Docker
     # deliberately starts with safe-state persistence disabled.
@@ -178,6 +184,174 @@ def _make_execute_only_env(forward_env=None):
     env._prefer_nonlogin = False
     env._last_sync_time = None
     return env
+
+
+def test_docker_marks_allowlisted_fresh_forward_env(monkeypatch):
+    from agent import secret_scope as ss
+
+    env = _make_execute_only_env(forward_env=["PATH"])
+    monkeypatch.setenv("PATH", "/fresh/bin:/usr/bin:/bin")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+    ss.set_multiplex_active(False)
+
+    values, unsets = env._resolve_passthrough_env()
+
+    assert values["PATH"] == "/fresh/bin:/usr/bin:/bin"
+    assert values[SAFE_STATE_FRESH_NAMES_ENV] == "PATH"
+    assert values[SAFE_STATE_PASSTHROUGH_ENV] == "1"
+    assert unsets == set()
+
+
+def test_docker_fresh_empty_allowlisted_value_beats_stale_static(monkeypatch):
+    from agent import secret_scope as ss
+
+    env = _make_execute_only_env(forward_env=["_CE_M"])
+    env._env = {"_CE_M": "stale-static"}
+    monkeypatch.setenv("_CE_M", "")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+    ss.set_multiplex_active(False)
+
+    values, unsets = env._resolve_passthrough_env()
+    args, _ = env._build_init_env_args()
+
+    assert values["_CE_M"] == ""
+    assert values[SAFE_STATE_FRESH_NAMES_ENV] == "_CE_M"
+    assert unsets == set()
+    assert "_CE_M=" in args
+    assert "_CE_M=stale-static" not in args
+
+
+def test_legacy_state_cleanup_failure_discards_container(monkeypatch):
+    env = _make_execute_only_env()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(
+            cmd,
+            1 if cmd[1] == "exec" else 0,
+            stdout="",
+            stderr="synthetic cleanup failure" if cmd[1] == "exec" else "",
+        )
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="legacy safe-state cleanup failed"):
+        env._cleanup_legacy_safe_state()
+
+    assert env._container_id is None
+    assert [env._docker_exe, "rm", "-f", "test-container"] in calls
+
+
+def test_legacy_cleanup_removal_failure_keeps_retry_handle(monkeypatch):
+    env = _make_execute_only_env()
+
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="synthetic failure"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="legacy safe-state cleanup failed"):
+        env._cleanup_legacy_safe_state()
+
+    assert env._container_id is None
+    assert env._quarantined_container_id == "test-container"
+
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 0, stdout="", stderr=""
+        ),
+    )
+    env.cleanup()
+    assert env._quarantined_container_id is None
+
+
+def test_quarantined_container_cannot_execute_commands():
+    env = _make_execute_only_env()
+    env._quarantined_container_id = "unsafe-container"
+    env._container_id = None
+
+    result = env.execute("printf should-not-run")
+
+    assert result["returncode"] != 0
+    assert "quarantined" in result["output"].lower()
+    assert "should-not-run" not in result["output"]
+
+
+def test_recovery_cleans_legacy_state_before_reinitializing():
+    env = _make_execute_only_env()
+    env._labels = {
+        "hermes-task-id": "task",
+        "hermes-profile": "default",
+        "hermes-egress": "off",
+    }
+    env._find_reusable_container = lambda *args: ("reused-cid", "running")
+    env._safe_state_disabled_reason = None
+    order = []
+    env._cleanup_legacy_safe_state = lambda: order.append("cleanup")
+    env.init_session = lambda: order.append("init")
+
+    recovered = env._recreate_container()
+
+    assert recovered is True
+    assert env._container_id == "reused-cid"
+    assert order == ["cleanup", "init"]
+
+
+def test_recovery_cannot_reenable_permanently_disabled_state():
+    env = _make_execute_only_env()
+    env._labels = {
+        "hermes-task-id": "task",
+        "hermes-profile": "default",
+        "hermes-egress": "off",
+    }
+    env._safe_state_ready = False
+    env._safe_state_disabled_reason = "command_failed"
+    env._find_reusable_container = lambda *args: ("reused-cid", "running")
+    env._cleanup_legacy_safe_state = lambda: None
+
+    def unsafe_reinitialize():
+        env._safe_state_ready = True
+        env._safe_state_disabled_reason = None
+
+    env.init_session = unsafe_reinitialize
+
+    recovered = env._recreate_container()
+
+    assert recovered is True
+    assert env._container_id == "reused-cid"
+    assert env._safe_state_ready is False
+    assert env._safe_state_disabled_reason == "command_failed"
+
+
+def test_execute_recreates_missing_container_before_base_execute(monkeypatch):
+    env = _make_execute_only_env()
+    env._container_id = None
+    env._quarantined_container_id = None
+    env._persist_across_processes = True
+    recovery_calls = []
+
+    def recover():
+        recovery_calls.append("recover")
+        env._container_id = "replacement-cid"
+        return True
+
+    def base_execute(self, command, cwd="", **kwargs):
+        assert self._container_id == "replacement-cid"
+        return {"output": "recovered", "returncode": 0}
+
+    env._recreate_container = recover
+    monkeypatch.setattr(BaseEnvironment, "execute", base_execute)
+
+    result = env.execute("printf recovered")
+
+    assert recovery_calls == ["recover"]
+    assert result == {"output": "recovered", "returncode": 0}
 
 
 def test_init_env_args_uses_hermes_dotenv_for_allowlisted_env(monkeypatch):
@@ -296,9 +470,30 @@ def test_runtime_exec_tracks_scope_and_clears_missing_value(monkeypatch):
 
     first_cmd = calls[0][0]
     assert "SERVICE_TOKEN=token-for-profile-a" in first_cmd
-    second_cmd = calls[1][0]
+    second_cmd, second_transport = calls[1]
     assert "SERVICE_TOKEN=token-for-profile-a" not in second_cmd
-    assert "unset SERVICE_TOKEN" in second_cmd[-1]
+    assert second_transport.startswith("unset SERVICE_TOKEN")
+
+
+@pytest.mark.parametrize("stdin_data", (None, "", "payload"))
+def test_docker_run_bash_transports_long_script_over_stdin(monkeypatch, stdin_data):
+    env = _make_execute_only_env()
+    calls = []
+    monkeypatch.setattr(
+        docker_env,
+        "_popen_bash",
+        lambda cmd, data=None: calls.append((cmd, data)) or object(),
+    )
+    script = "printf x # " + ("x" * 40_000)
+
+    env._run_bash(script, stdin_data=stdin_data)
+
+    cmd, transported = calls[0]
+    assert "-i" in cmd
+    assert script not in cmd
+    assert max(map(len, cmd)) < 1_000
+    assert transported == script + "\0" + (stdin_data or "")
+    assert cmd[-3:-1] == ["bash", "-c"]
 
 
 def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, tmp_path):
@@ -317,7 +512,8 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
         """Execute the generated docker exec command in a real local bash."""
         container_index = cmd.index(env._container_id)
         child_env = os.environ.copy()
-        index = 2
+        assert cmd[2] == "-i"
+        index = 3
         while index < container_index:
             assert cmd[index] == "-e"
             key, value = cmd[index + 1].split("=", 1)
@@ -326,16 +522,18 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
         assert cmd[container_index + 1 : container_index + 4] == [
             "bash", "-l", "-c",
         ]
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             [_find_bash(), "-c", cmd[container_index + 4]],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
             env=child_env,
         )
+        _pipe_stdin(proc, stdin_data)
+        return proc
 
     monkeypatch.setattr(docker_env, "_popen_bash", _run_fake_docker_exec)
     ss.set_multiplex_active(True)
@@ -359,66 +557,20 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
         ss.set_multiplex_active(False)
 
 
-def test_single_profile_docker_uses_safe_state(monkeypatch, tmp_path):
-    from agent import secret_scope as ss
-    from tools.environments.local import _find_bash, _windows_to_msys_path
-
+def test_single_profile_docker_safe_state_is_unsupported(tmp_path):
     env = _make_execute_only_env()
-    env.cwd = "/"
-    state_native = tmp_path / "docker-safe-state.v1"
-    env._safe_state_path = (
-        _windows_to_msys_path(str(state_native))
-        if sys.platform == "win32"
-        else str(state_native)
-    )
+    env._safe_state_path = str(tmp_path / "docker-safe-state.v1")
     env._safe_state_ready = False
     env._safe_state_disabled_reason = None
-    env._safe_state_warning_emitted = False
+    calls = []
+    env._run_bash = lambda *args, **kwargs: calls.append((args, kwargs))
 
-    def _run_fake_docker_exec(cmd, stdin_data=None):
-        container_index = cmd.index(env._container_id)
-        child_env = os.environ.copy()
-        index = 2
-        while index < container_index:
-            assert cmd[index] == "-e"
-            key, value = cmd[index + 1].split("=", 1)
-            child_env[key] = value
-            index += 2
-        shell_args = cmd[container_index + 1 :]
-        assert shell_args[:1] == ["bash"]
-        script = shell_args[-1]
-        return subprocess.Popen(
-            [_find_bash(), "-c", script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=child_env,
-        )
+    env.init_session()
 
-    monkeypatch.setattr(docker_env, "_popen_bash", _run_fake_docker_exec)
-    ss.set_multiplex_active(False)
-    venv_path = (
-        _windows_to_msys_path(str(tmp_path / "venv"))
-        if sys.platform == "win32"
-        else str(tmp_path / "venv")
-    )
-    try:
-        env.init_session()
-        activated = env.execute(
-            f"export VIRTUAL_ENV='{venv_path}'; "
-            f"export PATH='{venv_path}/bin':\"$PATH\""
-        )
-        observed = env.execute("printf '%s' \"${VIRTUAL_ENV-unset}\"")
-    finally:
-        state_native.unlink(missing_ok=True)
-
-    assert env._safe_state_ready is True
-    assert activated["returncode"] == 0
-    assert observed["returncode"] == 0
-    assert observed["output"] == venv_path
+    assert calls == []
+    assert env._safe_state_ready is False
+    assert env._safe_state_disabled_reason == "unsupported_backend"
+    assert not (tmp_path / "docker-safe-state.v1").exists()
 
 
 def test_multiplexed_docker_init_never_starts_safe_state(tmp_path):
@@ -517,7 +669,7 @@ def test_concurrent_login_invocations_keep_unsets_local(monkeypatch):
         docker_env,
         "_popen_bash",
         lambda cmd, stdin_data=None: commands.__setitem__(
-            threading.current_thread().name, cmd
+            threading.current_thread().name, (cmd, stdin_data)
         ) or object(),
     )
 
@@ -550,14 +702,14 @@ def test_concurrent_login_invocations_keep_unsets_local(monkeypatch):
 
     assert not missing.is_alive() and not present.is_alive()
     assert errors == []
-    missing_cmd = commands["missing-scope"]
-    present_cmd = commands["present-scope"]
+    missing_cmd, missing_transport = commands["missing-scope"]
+    present_cmd, present_transport = commands["present-scope"]
     assert not any(arg.startswith("EXPLICIT_TOKEN=") for arg in missing_cmd)
-    assert "unset EXPLICIT_TOKEN" in missing_cmd[-1]
+    assert missing_transport.startswith("unset EXPLICIT_TOKEN")
     assert "EXPLICIT_TOKEN=token-for-profile-b" in present_cmd
     assert "EXPLICIT_TOKEN=static-profile-a" not in present_cmd
     assert "EXPLICIT_TOKEN=token-for-default" not in present_cmd
-    assert "unset EXPLICIT_TOKEN" not in present_cmd[-1]
+    assert not present_transport.startswith("unset EXPLICIT_TOKEN")
 
 
 # ── docker_env tests ──────────────────────────────────────────────
@@ -868,6 +1020,7 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     despite docs claiming "ONE long-lived container shared across sessions"."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    docker_env._cgroup_limits_ok = True
     calls = _mock_subprocess_run_with_reuse(monkeypatch, ps_state="running")
 
     env = _make_dummy_env(task_id="reuse-test")
@@ -886,6 +1039,15 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert not start_invocations, (
         f"docker start should be skipped when container already running, got: {start_invocations}"
     )
+    legacy_cleanup = [
+        c for c in calls
+        if isinstance(c[0], list)
+        and len(c[0]) >= 2
+        and c[0][1] == "exec"
+        and "hermes-snap-*.sh" in " ".join(c[0])
+    ]
+    assert len(legacy_cleanup) == 1
+    assert "reused-cid" in legacy_cleanup[0][0]
 
 
 def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):

@@ -328,6 +328,7 @@ class TestWrapCommandWindowsNativeCwd:
             env._safe_state_path = state
             env._safe_state_platform = "msys"
             env._cwd_file = state + ".cwd"
+            monkeypatch.setattr(env, "_prepare_safe_state_target", lambda: (True, ""))
             env.init_session()
 
         script = captured["script"]

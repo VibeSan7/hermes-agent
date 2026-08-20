@@ -57,11 +57,13 @@ class TestWrapCommandAdvertisesHarness:
         from tools.environments.local import LocalEnvironment
 
         env = LocalEnvironment.__new__(LocalEnvironment)
-        env._snapshot_ready = False
+        env._safe_state_ready = False
+        env._safe_state_disabled_reason = None
+        env._safe_state_warning_emitted = False
         env._session_id = "testsession0"
         env._cwd_marker = "__HERMES_CWD_testsession0__"
-        env._snapshot_path = "/tmp/hermes-snap-testsession0.sh"
-        env._snapshot_passthrough_names = set()
+        env._safe_state_marker = "__HERMES_SAFE_STATE_testsession0__"
+        env._safe_state_path = "/tmp/hermes-safe-state-testsession0.v1"
         return env._wrap_command(command, "/tmp")
 
     def test_wrap_command_contains_export(self):
@@ -75,19 +77,21 @@ class TestWrapCommandAdvertisesHarness:
 
     def test_shell_sets_default_and_preserves_outer(self):
         """Run the wrapped script through real bash both ways."""
+        from tools.environments.local import _find_bash
+
         wrapped = self._wrap('echo "AI=$AI_AGENT HERMES=$HERMES_AGENT"')
 
         clean_env = {k: v for k, v in os.environ.items()
                      if k not in ("AI_AGENT", "HERMES_AGENT")}
         out = subprocess.run(
-            ["bash", "-c", wrapped], capture_output=True, text=True,
+            [_find_bash(), "-c", wrapped], capture_output=True, text=True,
             env=clean_env, timeout=30,
         )
         assert f"AI={HARNESS_ID} HERMES=true" in out.stdout
 
         outer_env = dict(clean_env, AI_AGENT="pi", HERMES_AGENT="false")
         out = subprocess.run(
-            ["bash", "-c", wrapped], capture_output=True, text=True,
+            [_find_bash(), "-c", wrapped], capture_output=True, text=True,
             env=outer_env, timeout=30,
         )
         assert "AI=pi HERMES=false" in out.stdout

@@ -13,10 +13,16 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
+from contextvars import ContextVar
 from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment, _pipe_stdin
+from tools.environments.safe_terminal_state import (
+    SAFE_STATE_FRESH_NAMES_ENV,
+    SAFE_STATE_NAMES,
+    SAFE_STATE_PASSTHROUGH_ENV,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -33,6 +39,7 @@ def _prune_stale_local_state_files(cache_dir: Path) -> None:
         "hermes-safe-state-*.v1",
         "hermes-safe-state-*.v1.tmp.*",
         "hermes-snap-*.sh",
+        "hermes-snap-*.sh.tmp.*",
     )
     for pattern in patterns:
         for candidate in cache_dir.glob(pattern):
@@ -127,6 +134,58 @@ def _windows_acl_is_private(path: Path) -> bool:
             return False
         observed.add(win32security.ConvertSidToStringSid(sid))
     return observed == expected
+
+
+def _local_owner_is_current_user(path: Path, info=None) -> bool:
+    if _IS_WINDOWS:
+        import win32security
+
+        security = win32security.GetNamedSecurityInfo(
+            str(path),
+            win32security.SE_FILE_OBJECT,
+            win32security.OWNER_SECURITY_INFORMATION,
+        )
+        owner = security.GetSecurityDescriptorOwner()
+        return win32security.ConvertSidToStringSid(owner) == win32security.ConvertSidToStringSid(
+            _windows_current_user_sid()
+        )
+    if not hasattr(os, "getuid"):
+        return True
+    info = info or path.stat()
+    return info.st_uid == os.getuid()
+
+
+def _path_chain_has_reparse(path: Path) -> bool:
+    current = Path(os.path.abspath(path))
+    while True:
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            parent = current.parent
+            if parent == current:
+                raise
+            current = parent
+            continue
+        attributes = getattr(info, "st_file_attributes", 0)
+        if stat.S_ISLNK(info.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _validate_safe_state_parent(path: Path, expected_parent: Path) -> tuple[bool, str]:
+    try:
+        if _path_chain_has_reparse(path.parent) or _path_chain_has_reparse(expected_parent):
+            return False, "parent_reparse"
+        if path.parent.resolve(strict=True) != expected_parent.resolve(strict=True):
+            return False, "outside_private_cache"
+    except FileNotFoundError:
+        return False, "missing_parent"
+    except OSError:
+        return False, "stat_failed"
+    return True, ""
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -1390,14 +1449,35 @@ def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
         from tools.env_passthrough import (
+            get_all_passthrough as _get_all_passthrough,
             is_env_passthrough as _is_passthrough,
             resolve_passthrough_value as _resolve_passthrough_value,
         )
     except Exception:
+        _get_all_passthrough = lambda: frozenset()  # noqa: E731
         _is_passthrough = lambda _: False  # noqa: E731
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
+    try:
+        passthrough_names = set(_get_all_passthrough())
+    except Exception:
+        passthrough_names = set()
+    fresh_safe_state_names = set(SAFE_STATE_NAMES) & passthrough_names
+
     merged = dict(os.environ | env)
+    resolved_passthrough_values: dict[str, str] = {}
+    for name in passthrough_names:
+        try:
+            value = _resolve_passthrough_value(name, merged.get(name))
+        except Exception:
+            value = None
+        if value is not None:
+            resolved_passthrough_values[name] = value
+    fresh_safe_state_values = {
+        name: value
+        for name, value in resolved_passthrough_values.items()
+        if name in fresh_safe_state_names
+    }
     run_env = {}
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -1440,6 +1520,20 @@ def _make_run_env(env: dict) -> dict:
     _inject_session_context_env(run_env)
 
     _strip_hermes_owned_pythonpath_and_runtime_markers(run_env)
+
+    for name, value in fresh_safe_state_values.items():
+        run_env.setdefault(name, value)
+
+    if fresh_safe_state_names:
+        run_env[SAFE_STATE_FRESH_NAMES_ENV] = ":".join(sorted(fresh_safe_state_names))
+    else:
+        run_env.pop(SAFE_STATE_FRESH_NAMES_ENV, None)
+
+    passthrough_active = any(name in run_env for name in passthrough_names)
+    if passthrough_active:
+        run_env[SAFE_STATE_PASSTHROUGH_ENV] = "1"
+    else:
+        run_env.pop(SAFE_STATE_PASSTHROUGH_ENV, None)
 
     _apply_windows_msys_bash_env_defaults(run_env)
 
@@ -1824,6 +1918,9 @@ class LocalEnvironment(BaseEnvironment):
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         self._local_safe_dir_ready = True
+        self._prepared_run_env = ContextVar(
+            f"hermes_local_run_env_{id(self)}", default=None
+        )
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
         if _IS_WINDOWS:
@@ -1839,7 +1936,13 @@ class LocalEnvironment(BaseEnvironment):
 
         cache_dir = get_hermes_home() / "cache" / "terminal"
         try:
+            if _path_chain_has_reparse(cache_dir):
+                raise RuntimeError("terminal cache parent chain contains a reparse point")
             cache_dir.mkdir(parents=True, exist_ok=True)
+            if _path_chain_has_reparse(cache_dir):
+                raise RuntimeError("terminal cache parent chain changed during creation")
+            if not _local_owner_is_current_user(cache_dir):
+                raise RuntimeError("terminal cache owner is not the current user")
             if _IS_WINDOWS:
                 _set_windows_private_acl(cache_dir, directory=True)
             else:
@@ -1864,12 +1967,40 @@ class LocalEnvironment(BaseEnvironment):
         """Rewrite the safe-state path into the target Bash namespace."""
         return _bash_safe_path(path)
 
+    def _safe_state_python_path(self) -> str | None:
+        import sys as _sys
+
+        return _bash_safe_path(_sys.executable)
+
+    def _safe_state_preflight_off_reason(self) -> str | None:
+        prepared_run_env = getattr(self, "_prepared_run_env", None)
+        if prepared_run_env is not None:
+            prepared_run_env.set(None)
+        run_env = _make_run_env(self.env)
+        if prepared_run_env is not None:
+            prepared_run_env.set(run_env)
+        if run_env.get(SAFE_STATE_PASSTHROUGH_ENV) == "1":
+            return "passthrough"
+        if run_env.get("BASH_ENV") or run_env.get("ENV"):
+            return "shell_startup"
+        if any(name.startswith("BASH_FUNC_") for name in run_env):
+            return "shell_startup"
+        return None
+
+    def _safe_state_revision(self):
+        try:
+            info = Path(self._safe_state_path).stat()
+        except FileNotFoundError:
+            return None
+        return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+
     def _prepare_safe_state_artifact(self) -> tuple[bool, str]:
         path = Path(self._safe_state_path)
+        expected_parent = Path(self.get_temp_dir())
+        parent_valid, reason = _validate_safe_state_parent(path, expected_parent)
+        if not parent_valid:
+            return False, reason
         try:
-            expected_parent = Path(self.get_temp_dir()).resolve(strict=True)
-            if path.parent.resolve(strict=True) != expected_parent:
-                return False, "outside_private_cache"
             info = path.lstat()
         except FileNotFoundError:
             return False, "missing"
@@ -1883,6 +2014,11 @@ class LocalEnvironment(BaseEnvironment):
             return False, "non_regular"
         if info.st_nlink != 1:
             return False, "hardlink"
+        try:
+            if not _local_owner_is_current_user(path, info):
+                return False, "owner"
+        except Exception:
+            return False, "owner_check_failed"
 
         try:
             if _IS_WINDOWS:
@@ -1904,10 +2040,11 @@ class LocalEnvironment(BaseEnvironment):
 
     def _prepare_safe_state_target(self) -> tuple[bool, str]:
         path = Path(self._safe_state_path)
+        expected_parent = Path(self.get_temp_dir())
+        parent_valid, reason = _validate_safe_state_parent(path, expected_parent)
+        if not parent_valid:
+            return False, reason
         try:
-            expected_parent = Path(self.get_temp_dir()).resolve(strict=True)
-            if path.parent.resolve(strict=True) != expected_parent:
-                return False, "outside_private_cache"
             info = path.lstat()
         except FileNotFoundError:
             return True, ""
@@ -1921,6 +2058,11 @@ class LocalEnvironment(BaseEnvironment):
             return False, "non_regular"
         if info.st_nlink != 1:
             return False, "hardlink"
+        try:
+            if not _local_owner_is_current_user(path, info):
+                return False, "owner"
+        except Exception:
+            return False, "owner_check_failed"
         try:
             if _IS_WINDOWS:
                 if not _windows_acl_is_private(path):
@@ -1945,12 +2087,25 @@ class LocalEnvironment(BaseEnvironment):
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         script_input = None
         if _IS_WINDOWS and stdin_data is None:
-            args = [bash, "-l", "-s"] if login else [bash, "-s"]
+            loader = (
+                "_hermes_script=; "
+                "IFS= read -r -d '' _hermes_script || true; "
+                "exec </dev/null; eval \"$_hermes_script\""
+            )
+            args = [bash, "-l", "-c", loader] if login else [bash, "-c", loader]
+            # The small loader consumes the complete wrapper before evaluation,
+            # then detaches fd 0. User commands therefore see EOF without putting
+            # the large wrapper on Git-for-Windows' size-limited command line.
             script_input = cmd_string
         else:
             args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         input_payload = script_input if script_input is not None else stdin_data
-        run_env = _make_run_env(self.env)
+        prepared_run_env = getattr(self, "_prepared_run_env", None)
+        run_env = prepared_run_env.get() if prepared_run_env is not None else None
+        if prepared_run_env is not None:
+            prepared_run_env.set(None)
+        if run_env is None:
+            run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir

@@ -27,6 +27,11 @@ from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
 )
+from tools.environments.safe_terminal_state import (
+    SAFE_STATE_FRESH_NAMES_ENV,
+    SAFE_STATE_NAMES,
+    SAFE_STATE_PASSTHROUGH_ENV,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,10 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_LEGACY_SAFE_STATE_CLEANUP_SCRIPT = """for _hss_legacy in /tmp/hermes-snap-*.sh /tmp/hermes-snap-*.sh.tmp.*; do
+    [ -e \"$_hss_legacy\" ] || [ -L \"$_hss_legacy\" ] || continue
+    command rm -f -- \"$_hss_legacy\" || exit 1
+done"""
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -857,11 +866,13 @@ class DockerEnvironment(BaseEnvironment):
     boundary — the filesystem inside is writable so agents can install packages
     (pip, npm, apt) as needed. Writable workspace via tmpfs or bind mounts.
 
-    Persistence: when enabled, bind mounts preserve /workspace and /root
-    across container restarts.
+    Filesystem persistence: when enabled, bind mounts preserve /workspace and
+    /root across container restarts. Safe terminal environment persistence is
+    disabled in version 1 because Docker does not yet prove the required
+    owner/mode/symlink/hardlink identity contract inside the container.
     """
 
-    _safe_state_persistence_supported = True
+    _safe_state_persistence_supported = False
 
     def __init__(
         self,
@@ -897,6 +908,7 @@ class DockerEnvironment(BaseEnvironment):
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
         self._container_id: Optional[str] = None
+        self._quarantined_container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
         self._container_name: str = ""
@@ -1512,9 +1524,69 @@ class DockerEnvironment(BaseEnvironment):
             self._container_id = result.stdout.strip()
             logger.info("Started container %s (%s)", container_name, self._container_id[:12])
 
+        # Remove obsolete executable snapshots before any reused-container command.
+        self._cleanup_legacy_safe_state()
+
         # Initialize default-deny safe state inside the container. Multiplex
         # mode is detected by BaseEnvironment and leaves persistence off.
         self.init_session()
+
+    def _cleanup_legacy_safe_state(self) -> None:
+        """Delete obsolete plaintext shell snapshots before container use."""
+        assert self._container_id, "Container not started"
+        cmd = [
+            self._docker_exe,
+            "exec",
+            self._container_id,
+            "bash",
+            "-c",
+            _LEGACY_SAFE_STATE_CLEANUP_SCRIPT,
+        ]
+        cleanup_error: Exception | None = None
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+            )
+            if result.returncode != 0:
+                cleanup_error = RuntimeError("cleanup command failed")
+        except Exception as exc:
+            cleanup_error = exc
+        if cleanup_error is None:
+            return
+
+        unsafe_container = self._container_id
+        removed = False
+        try:
+            removal = subprocess.run(
+                [self._docker_exe, "rm", "-f", unsafe_container],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+            )
+            removed = removal.returncode == 0
+        except Exception:
+            logger.warning(
+                "Could not discard container after legacy state cleanup failure",
+                exc_info=True,
+            )
+        if removed:
+            self._container_id = None
+            self._quarantined_container_id = None
+        else:
+            self._container_id = None
+            self._quarantined_container_id = unsafe_container
+            logger.warning(
+                "Container quarantined for cleanup retry after legacy state removal failed: %s",
+                unsafe_container,
+            )
+        raise RuntimeError("legacy safe-state cleanup failed") from cleanup_error
 
     def _build_init_env_args(self) -> tuple[list[str], tuple[str, ...]]:
         """Build login env args and unsets from the active profile."""
@@ -1585,7 +1657,11 @@ class DockerEnvironment(BaseEnvironment):
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         unset_names: set[str] = set()
         for key in sorted(forward_keys):
-            fallback_value = os.getenv(key) or hermes_env.get(key)
+            shell_value = os.getenv(key)
+            if shell_value is not None and (shell_value != "" or key in SAFE_STATE_NAMES):
+                fallback_value = shell_value
+            else:
+                fallback_value = hermes_env.get(key)
             scoped_key = multiplex_active and not is_global_env(key)
             if resolve_passthrough_value is None:
                 value = None if scoped_key else fallback_value
@@ -1603,6 +1679,13 @@ class DockerEnvironment(BaseEnvironment):
                 exec_env[key] = value
             elif scoped_key and _ENV_VAR_NAME_RE.fullmatch(key):
                 unset_names.add(key)
+        if exec_env or self._env:
+            exec_env[SAFE_STATE_PASSTHROUGH_ENV] = "1"
+        fresh_safe_state_names = set(SAFE_STATE_NAMES) & forward_keys
+        if fresh_safe_state_names:
+            exec_env[SAFE_STATE_FRESH_NAMES_ENV] = ":".join(
+                sorted(fresh_safe_state_names)
+            )
         return exec_env, unset_names
 
     def _build_runtime_env_args_with_unsets(self) -> tuple[list[str], tuple[str, ...]]:
@@ -1622,9 +1705,7 @@ class DockerEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn a bash process inside the Docker container."""
         assert self._container_id, "Container not started"
-        cmd = [self._docker_exe, "exec"]
-        if stdin_data is not None:
-            cmd.append("-i")
+        cmd = [self._docker_exe, "exec", "-i"]
 
         # Login and runtime invocations resolve the active profile independently.
         # No scoped values or unset decisions are cached on this shared object.
@@ -1640,12 +1721,17 @@ class DockerEnvironment(BaseEnvironment):
 
         cmd.extend([self._container_id])
 
+        loader = (
+            "_hermes_script=; IFS= read -r -d '' _hermes_script || true; "
+            "builtin eval \"$_hermes_script\""
+        )
         if login:
-            cmd.extend(["bash", "-l", "-c", cmd_string])
+            cmd.extend(["bash", "-l", "-c", loader])
         else:
-            cmd.extend(["bash", "-c", cmd_string])
+            cmd.extend(["bash", "-c", loader])
 
-        return _popen_bash(cmd, stdin_data)
+        transport = cmd_string + "\0" + (stdin_data or "")
+        return _popen_bash(cmd, transport)
 
     # ------------------------------------------------------------------
     # "No such container" recovery (issue #36266)
@@ -1670,6 +1756,7 @@ class DockerEnvironment(BaseEnvironment):
         original error).
         """
         old_id = (self._container_id or "")[:12]
+        disabled_reason = self._safe_state_disabled_reason
         logger.warning(
             "Container %s appears to be gone — attempting recovery", old_id,
         )
@@ -1734,14 +1821,23 @@ class DockerEnvironment(BaseEnvironment):
                 logger.error("Recovery: failed to create new container: %s", e)
                 return False
 
-        # 3. Re-initialize safe state in the (re)created container.
+        # 3. Remove legacy plaintext snapshots, then re-initialize safe state.
         try:
-            self._safe_state_ready = False
-            self._safe_state_disabled_reason = None
-            self.init_session()
+            self._cleanup_legacy_safe_state()
         except Exception as e:
-            logger.error("Recovery: init_session failed in new container: %s", e)
+            logger.error("Recovery: legacy state cleanup failed: %s", e)
             return False
+        if disabled_reason is None:
+            try:
+                self._safe_state_ready = False
+                self._safe_state_disabled_reason = None
+                self.init_session()
+            except Exception as e:
+                logger.error("Recovery: init_session failed in new container: %s", e)
+                return False
+        else:
+            self._safe_state_ready = False
+            self._safe_state_disabled_reason = disabled_reason
 
         logger.info("Recovery successful — new container %s", (self._container_id or "")[:12])
         return True
@@ -1753,6 +1849,17 @@ class DockerEnvironment(BaseEnvironment):
         OOM kill, daemon restart), detect the error and recreate the container
         transparently before retrying once.
         """
+        if self._quarantined_container_id:
+            return {
+                "output": "Container quarantined after legacy state cleanup failure",
+                "returncode": 1,
+            }
+        if not self._container_id:
+            if not self._persist_across_processes or not self._recreate_container():
+                return {
+                    "output": "Container unavailable after cleanup or recovery failure",
+                    "returncode": 1,
+                }
         result = super().execute(command, cwd, **kwargs)
         if (
             result.get("returncode", 0) != 0
@@ -1974,6 +2081,23 @@ class DockerEnvironment(BaseEnvironment):
         thread to finish before the interpreter exits, so ``docker stop`` /
         ``docker rm`` actually completes when we do trigger it.
         """
+        quarantined = getattr(self, "_quarantined_container_id", None)
+        if quarantined:
+            try:
+                removal = subprocess.run(
+                    [self._docker_exe, "rm", "-f", quarantined],
+                    capture_output=True,
+                    timeout=30,
+                    stdin=subprocess.DEVNULL,
+                )
+                if removal.returncode == 0:
+                    self._quarantined_container_id = None
+                else:
+                    logger.warning("docker rm -f retry failed for quarantined container")
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                logger.warning("docker rm -f retry failed for quarantined container: %s", exc)
+            return
+
         container_id = self._container_id
         if not container_id:
             # Still drop the bind-mount dirs if any were allocated and we're

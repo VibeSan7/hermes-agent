@@ -557,13 +557,29 @@ terminal:
 injected for the current invocation only. They are never written into terminal
 state, so a later command must receive them through passthrough again.
 
-Terminal state is default-deny. In single-profile mode, only the fixed
-Python/Conda runtime allowlist (`PATH`, `VIRTUAL_ENV`, `CONDA_PREFIX`,
-`CONDA_DEFAULT_ENV`, `CONDA_SHLVL`, `CONDA_EXE`, `CONDA_PYTHON_EXE`, `_CE_CONDA`,
-and `_CE_M`) may persist after validation. Arbitrary exports, credentials,
-aliases, and shell functions do not persist. Multi-profile multiplex mode and
-backends that cannot prove the state-file security contract run with terminal
-environment persistence off.
+Forwarding any resolved passthrough value permanently disables terminal
+environment persistence for that Local environment object on the Python host
+before Bash startup, so shell init files cannot restore it. The command still
+receives the requested value. Starting another Local environment object is
+required before credential-free Python/Conda persistence can be enabled again.
+A command that exits nonzero likewise disables persistence without capture while
+preserving its original output and exit code. A non-empty `BASH_ENV`, `ENV`, or
+an imported `BASH_FUNC_*` function also disables persistence before apply,
+because startup code can replace Bash builtins. Hermes uses the same exact child
+environment for this host-side decision and for the subsequent Bash process.
+
+Terminal state is default-deny and Local-only in version 1. For credential-free,
+successful Local commands in single-profile mode, only the fixed Python/Conda
+runtime allowlist (`PATH`, `VIRTUAL_ENV`, `CONDA_PREFIX`, `CONDA_DEFAULT_ENV`,
+`CONDA_SHLVL`, `CONDA_EXE`, `CONDA_PYTHON_EXE`, `_CE_CONDA`, and `_CE_M`) may
+persist after validation. Capture stores only exported string values; Bash
+attributes such as `readonly`, nameref, arrays, integer, or case-conversion flags
+are not serialized. Exported values return as ordinary strings, while values
+that cannot be exported (for example arrays) become unset. Arbitrary exports,
+credentials, aliases, and shell functions do not persist. Docker, direct/managed Modal, multi-profile multiplex
+mode, and every backend that cannot prove the state-file security contract run
+with terminal environment persistence off. Docker filesystem persistence is a
+separate feature and remains available.
 
 ### Credential File Passthrough (OAuth tokens, etc.) {#credential-file-passthrough}
 

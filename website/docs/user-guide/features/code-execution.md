@@ -221,9 +221,15 @@ See the [Security guide](/user-guide/security#environment-variable-passthrough) 
 
 Passthrough is invocation-local: allowing a variable gives the current
 `execute_code` or `terminal` invocation access to it, but does not make it part
-of terminal state. Do not rely on `export` or a credential passthrough value
-surviving into a later command. Terminal state persists only the documented,
-validated Python/Conda runtime allowlist where the backend supports it.
+of terminal state. For Local, forwarding any resolved passthrough value disables
+persistence host-side before Bash startup; a nonzero command result disables it
+without capture. `BASH_ENV`, `ENV`, and imported `BASH_FUNC_*` startup hooks also
+disable Local persistence. Do not rely on `export` or a credential passthrough
+value surviving into a later command. Credential-free successful Local commands
+may persist only validated exported string values from the documented
+Python/Conda allowlist; Bash attributes are flattened rather than serialized.
+Docker, direct/managed Modal, and other unsupported backends keep terminal
+environment persistence off.
 
 ### `HERMES_*` variables in the child
 

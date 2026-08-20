@@ -106,6 +106,15 @@ class _FakeResponse:
         return self._payload
 
 
+def test_managed_modal_explicitly_disables_safe_state():
+    _install_fake_tools_package()
+    managed_modal = _load_tool_module(
+        "tools.environments.managed_modal", "environments/managed_modal.py"
+    )
+
+    assert managed_modal.ManagedModalEnvironment._safe_state_persistence_supported is False
+
+
 def test_managed_modal_execute_polls_until_completed(monkeypatch):
     _install_fake_tools_package()
     managed_modal = _load_tool_module("tools.environments.managed_modal", "environments/managed_modal.py")
