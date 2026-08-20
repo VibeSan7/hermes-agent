@@ -96,7 +96,7 @@ declare global {
         setIgnoreMouse: (ignore: boolean) => void
         moveBy: (delta: { x: number; y: number; width: number; height: number }) => void
         setBounds: (bounds: { x: number; y: number; width: number; height: number }) => void
-        setVibrancy: (on: boolean) => Promise<{ ok: boolean }>
+        setFrost: (showing: boolean) => Promise<{ ok: boolean }>
         setSession: (sessionId: null | string) => void
         onGoto: (callback: (sessionId: string) => void) => () => void
         onChanged: (callback: (state: { open: boolean; sessionId: null | string }) => void) => () => void
@@ -151,7 +151,11 @@ declare global {
         test: (id: string) => Promise<DesktopConnectionTestResult>
         // Fan out `hermes update` to every eligible registered connection;
         // cloud entries are skipped (platform-managed), each row independent.
-        updateAll?: () => Promise<{ ok: boolean; results: DesktopConnectionUpdateResult[] }>
+        // excludeIds skips connections the caller updates through another
+        // path (the everything-update flow's active backend + local client).
+        updateAll?: (options?: {
+          excludeIds?: string[]
+        }) => Promise<{ ok: boolean; results: DesktopConnectionUpdateResult[] }>
         // Registry lifecycle push: fired when a connection is removed or
         // materially edited so the renderer can dispose (and re-dial) the
         // secondary gateways scoped to it. Optional: older Electron mains
@@ -247,6 +251,10 @@ declare global {
       setActiveWork?: (payload: HermesActiveWork) => void
       setTitleBarTheme?: (payload: HermesTitleBarTheme) => void
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void
+      /** Main-process fact: this OS can back glass with a native material. */
+      glassSupported?: boolean
+      /** Main-process fact: this OS can do any translucency at all (not Linux). */
+      translucencySupported?: boolean
       setTranslucency?: (payload: TranslucencyState) => void
       setKeepAwake?: (on: boolean) => void
       setDisableF12?: (blocked: boolean) => void
